@@ -1,0 +1,246 @@
+"""Segmentation trainer for models.mita_segmentation, shared by segmentation_acc (accelerate) and
+segmentation_opt (optuna).
+
+`train(cfg)` merges the [dataset_paths], splits off validation data, trains with an accelerate loop, logs
+to TensorBoard in training_logs/<log_name>, evaluates on full validation images, and saves the model.
+
+Training recipe (from pp4av_train.ipynb):
+- each sample is a square window of the original image, sized so that resizing it to the model input gives
+  the model's upscale (jittered by `scale_jitter`); with probability `object_crop_prob` it contains a random
+  object (a connected region of non-background mask pixels); random horizontal flip and brightness/contrast
+- loss = cross-entropy + `dice_weight` * mean soft Dice over the non-background classes
+- MiTA-Segmenter's optimiser and polynomial schedule
+"""
+import json
+import random
+import shutil
+import time
+from pathlib import Path
+from types import SimpleNamespace
+
+import cv2
+import numpy as np
+import torch
+import torch.nn.functional as F
+from accelerate import Accelerator, DistributedDataParallelKwargs
+from datasets import Image as HFImage
+from torch.utils.tensorboard import SummaryWriter
+
+from data_pipeline.formats import SEGMENTATION_CLASSES
+from models.mita_segmentation import MitaSegmentation
+from segm.optim.factory import create_optimizer, create_scheduler
+from trainer.common import (LOGS_ROOT, WEIGHTS_ROOT, load_merged_dataset, model_id, train_valid_split)
+
+MODEL_NAME = "mita_segmentation"
+cv2.setNumThreads(0)                     # let DataLoader workers parallelise, not OpenCV threads
+
+
+def decode_row(row):
+    """Row with undecoded image/mask -> RGB uint8 [H, W, 3], class-index uint8 [H, W]."""
+    img = cv2.imdecode(np.frombuffer(row["image"]["bytes"], np.uint8), cv2.IMREAD_COLOR)
+    mask = cv2.imdecode(np.frombuffer(row["mask"]["bytes"], np.uint8), cv2.IMREAD_UNCHANGED)
+    return cv2.cvtColor(img, cv2.COLOR_BGR2RGB), mask
+
+
+def undecoded(ds):
+    """Images and masks as raw bytes: decoded with OpenCV in the workers instead of PIL."""
+    return ds.cast_column("image", HFImage(decode=False)).cast_column("mask", HFImage(decode=False))
+
+
+class CropDataset(torch.utils.data.Dataset):
+    def __init__(self, ds, input_size, upscale, tcfg):
+        self.ds, self.input_size, self.upscale = undecoded(ds), input_size, upscale
+        self.scale_jitter, self.object_crop_prob = tuple(tcfg["scale_jitter"]), tcfg["object_crop_prob"]
+
+    def __len__(self):
+        return len(self.ds)
+
+    def __getitem__(self, i):
+        img, mask = decode_row(self.ds[i])
+        H, W = img.shape[:2]
+        size = self.input_size
+        scale = self.upscale * random.uniform(*self.scale_jitter)
+        win = min(int(round(size / scale)), H, W)                 # window side in original pixels
+
+        if random.random() < self.object_crop_prob and mask.any():
+            n, _, stats, _ = cv2.connectedComponentsWithStats((mask > 0).astype(np.uint8), connectivity=8)
+            x1, y1, bw, bh = stats[random.randrange(1, n), :4]     # component 0 is the background
+            x2, y2 = x1 + bw, y1 + bh
+            x0 = random.uniform(max(0, x2 - win), max(0, min(x1, W - win)))
+            y0 = random.uniform(max(0, y2 - win), max(0, min(y1, H - win)))
+        else:
+            x0, y0 = random.uniform(0, W - win), random.uniform(0, H - win)
+        x0, y0 = int(min(x0, W - win)), int(min(y0, H - win))
+
+        crop = cv2.resize(img[y0:y0 + win, x0:x0 + win], (size, size), interpolation=cv2.INTER_LINEAR)
+        crop_mask = cv2.resize(mask[y0:y0 + win, x0:x0 + win], (size, size), interpolation=cv2.INTER_NEAREST)
+        if random.random() < 0.5:
+            crop, crop_mask = crop[:, ::-1], crop_mask[:, ::-1]
+        alpha, beta = random.uniform(0.8, 1.2), random.uniform(-20, 20)
+        crop = np.clip(crop.astype(np.float32) * alpha + beta, 0, 255).astype(np.uint8)
+        return (torch.from_numpy(np.ascontiguousarray(crop)).permute(2, 0, 1),
+                torch.from_numpy(np.ascontiguousarray(crop_mask)).long())
+
+
+def dice_loss(logits, target, cls):
+    """Soft Dice loss of one class: 0 = predicted region matches the labelled one, 1 = no overlap."""
+    p = logits.softmax(1)[:, cls]
+    t = (target == cls).float()
+    inter = (p * t).sum()
+    return 1 - (2 * inter + 1) / (p.sum() + t.sum() + 1)
+
+
+@torch.no_grad()
+def evaluate(model, ds, batch_size=16, accelerator=None):
+    """Full-image sliding-window inference on `ds` -> per-class Dice and IoU of the argmax prediction,
+    summed over all pixels of all images. With an accelerator, each process takes a shard and counts are summed."""
+    n_cls = len(model.classes)
+    if accelerator is not None and accelerator.num_processes > 1:
+        ds = ds.shard(accelerator.num_processes, accelerator.process_index, contiguous=True)
+    device = model.mean.device
+    counts = torch.zeros(3, n_cls, dtype=torch.float64, device=device)     # intersection, predicted, labelled
+    was_training = model.training
+    model.eval()
+    for row in undecoded(ds):
+        img, mask = decode_row(row)
+        pred = model.predict(img, batch_size=batch_size).argmax(0)
+        target = torch.from_numpy(mask).to(device).long()
+        counts[0] += torch.bincount(target[pred == target], minlength=n_cls)[:n_cls].double()
+        counts[1] += torch.bincount(pred.flatten(), minlength=n_cls)[:n_cls].double()
+        counts[2] += torch.bincount(target.flatten(), minlength=n_cls)[:n_cls].double()
+    model.train(was_training)
+    if accelerator is not None:
+        counts = accelerator.reduce(counts, reduction="sum")
+    inter, pred_n, true_n = counts.cpu().numpy()
+    dice = 2 * inter / np.maximum(pred_n + true_n, 1)
+    iou = inter / np.maximum(pred_n + true_n - inter, 1)
+    metrics = {}
+    for c, name in enumerate(model.classes):
+        metrics[f"dice_{name}"], metrics[f"iou_{name}"] = float(dice[c]), float(iou[c])
+    metrics["mean_dice"] = float(dice[1:].mean())          # over the non-background classes
+    metrics["mean_iou"] = float(iou[1:].mean())
+    return metrics
+
+
+def build_model(cfg):
+    classes = cfg["classification"]["classes"]
+    if classes != SEGMENTATION_CLASSES[:len(classes)]:
+        raise ValueError(f"[classification] classes {classes} must match the segmentation format's label ids "
+                         f"{SEGMENTATION_CLASSES} (data_pipeline/formats.py)")
+    t = cfg["training"]
+    return MitaSegmentation(backbone=t["backbone"], classes=classes, grid=t["grid"], px_per_patch=t["px_per_patch"],
+                            dropout=t["dropout"], drop_path_rate=t["drop_path_rate"])
+
+
+def save_model(model, out_dir, cfg, state):
+    model.save(out_dir)
+    shutil.copy(cfg["_path"], Path(out_dir) / "config.toml")
+    (Path(out_dir) / "train_state.json").write_text(json.dumps(dict(state, training=cfg["training"]), indent=2))
+
+
+def train(cfg, log_name=None, weights_dir=None, report=None):
+    """Train one model as configured. `report(metrics, epoch)` is called after each evaluation (optuna uses it
+    to prune). Returns the last validation metrics. Weights are saved to `weights_dir` after every epoch
+    unless it is None."""
+    if cfg["model_name"] != MODEL_NAME:
+        raise ValueError(f"the segmentation trainer trains {MODEL_NAME!r}, config asks for {cfg['model_name']!r}")
+    t = cfg["training"]
+    accelerator = Accelerator(
+        mixed_precision=cfg["accelerate"].get("mixed_precision", "no"),
+        # as MiTA-Segmenter's train.py: the encoder's ImageNet classification head gets no gradient
+        kwargs_handlers=[DistributedDataParallelKwargs(find_unused_parameters=True)],
+    )
+    torch.manual_seed(t["seed"] + accelerator.process_index)
+    random.seed(t["seed"] + accelerator.process_index)
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+
+    ds = load_merged_dataset(cfg["dataset_paths"])
+    train_ds, valid_ds = train_valid_split(ds, t["valid_fraction"], t.get("valid_subsets", []), t["seed"])
+
+    model = build_model(cfg)
+    loader = torch.utils.data.DataLoader(
+        CropDataset(train_ds, model.input_size, model.upscale, t), batch_size=t["batch_size"], shuffle=True,
+        drop_last=True, num_workers=t["num_workers"], pin_memory=True, persistent_workers=t["num_workers"] > 0,
+    )
+    loader = accelerator.prepare(loader)                       # sharded across devices
+    steps_per_epoch = len(loader)
+    opt_args = SimpleNamespace(
+        opt=t["opt"], lr=t["lr"], weight_decay=t["weight_decay"], momentum=t["momentum"],
+        sched=t["sched"], poly_power=t["poly_power"], poly_step_size=t["poly_step_size"], min_lr=t["min_lr"],
+        epochs=t["epochs"], iter_max=steps_per_epoch * t["epochs"], iter_warmup=0.0,
+    )
+    optimizer = create_optimizer(opt_args, model.net)
+    lr_scheduler = create_scheduler(opt_args, optimizer)      # stepped per update via step_update, not prepared
+    model, optimizer = accelerator.prepare(model, optimizer)
+    raw_model = accelerator.unwrap_model(model)
+
+    log_name = log_name or model_id(cfg)
+    writer = SummaryWriter(str(LOGS_ROOT / log_name)) if accelerator.is_main_process else None
+    if writer:
+        writer.add_text("config", "```toml\n" + Path(cfg["_path"]).read_text() + "\n```")
+        writer.add_text("training", "```json\n" + json.dumps(t, indent=2) + "\n```")
+        accelerator.print(f"{len(train_ds)} train / {len(valid_ds)} valid images, {steps_per_epoch} steps per epoch "
+                          f"on {accelerator.num_processes} device(s); logs in {LOGS_ROOT / log_name}")
+
+    fg = list(enumerate(raw_model.classes))[1:]
+    state, metrics = dict(epoch=0, step=0), {}
+    acc = dict(loss=0.0, ce=0.0, **{f"dice_{n}": 0.0 for _, n in fg}, n=0, t=time.perf_counter())
+    model.train()
+    try:
+        while state["epoch"] < t["epochs"]:
+            for ims, masks in loader:
+                with accelerator.autocast():
+                    logits = model(ims)
+                logits = logits.float()
+                ce = F.cross_entropy(logits, masks)
+                dice = {name: dice_loss(logits, masks, c) for c, name in fg}
+                loss = ce + t["dice_weight"] * sum(dice.values()) / len(dice)
+
+                optimizer.zero_grad(set_to_none=True)
+                accelerator.backward(loss)
+                optimizer.step()
+                state["step"] += 1
+                lr_scheduler.step_update(num_updates=state["step"])
+
+                acc["loss"] += loss.item(); acc["ce"] += ce.item(); acc["n"] += 1
+                for name, d in dice.items():
+                    acc[f"dice_{name}"] += d.item()
+                if state["step"] % t["log_every"] == 0 and writer:
+                    n, dt = acc.pop("n"), time.perf_counter() - acc.pop("t")
+                    for k, v in acc.items():
+                        writer.add_scalar(f"train/{k}", v / n, state["step"])
+                    writer.add_scalar("train/lr", optimizer.param_groups[0]["lr"], state["step"])
+                    writer.add_scalar("perf/img_per_s", n * t["batch_size"] * accelerator.num_processes / dt, state["step"])
+                    if torch.cuda.is_available():
+                        writer.add_scalar("perf/gpu_mem_gb", torch.cuda.max_memory_allocated() / 1e9, state["step"])
+                    acc = dict({k: 0.0 for k in acc}, n=0, t=time.perf_counter())
+            state["epoch"] += 1
+
+            last = state["epoch"] == t["epochs"]
+            if state["epoch"] % t["eval_every"] == 0 or last:
+                metrics = evaluate(raw_model, valid_ds, t["eval_batch_size"], accelerator)
+                if writer:
+                    for k, v in metrics.items():
+                        writer.add_scalar(f"valid/{k}", v, state["step"])
+                    accelerator.print(f"epoch {state['epoch']}/{t['epochs']}  " +
+                                      "  ".join(f"{k} {v:.4f}" for k, v in metrics.items() if k.startswith("mean")))
+                if report is not None:
+                    report(metrics, state["epoch"])
+            if weights_dir is not None and accelerator.is_main_process:
+                save_model(raw_model, weights_dir, cfg, dict(state, valid=metrics))
+    except KeyboardInterrupt:
+        accelerator.print("interrupted")
+        if weights_dir is not None and accelerator.is_main_process:
+            save_model(raw_model, weights_dir, cfg, dict(state, valid=metrics))
+        raise
+    finally:
+        if writer:
+            writer.close()
+    accelerator.wait_for_everyone()
+    accelerator.free_memory()
+    return metrics, raw_model
+
+
+def default_weights_dir(cfg):
+    return WEIGHTS_ROOT / model_id(cfg)

@@ -1,0 +1,120 @@
+"""PP4AV -> segmentation format (background / face / plate masks, boxes filled in).
+
+Downloads the PP4AV zips from Hugging Face once, rasterises each image's boxes into a class mask at the original
+resolution, and saves two Hugging Face datasets into the data version directory:
+
+    <save_dir>/pp4av_segmentation_train    every subset except --test_subsets
+    <save_dir>/pp4av_segmentation_test     whole held-out subsets (frames within a city are near-duplicates,
+                                           so a random split would leak; see pp4av_eda.ipynb)
+
+Usage:
+    python -m data_pipeline.pp4av_to_segmentation --save_dir data/v1
+"""
+import argparse
+import shutil
+import tempfile
+import zipfile
+from pathlib import Path
+
+import cv2
+import numpy as np
+from datasets import Dataset
+
+from data_pipeline.formats import SEGMENTATION_CLASSES, SEGMENTATION_FEATURES, split_names
+
+HF_REPO = "khaclinh/pp4av"
+SOURCE = "pp4av"
+IMG_EXTS = {".png", ".jpg", ".jpeg"}
+# PP4AV label file class -> index in SEGMENTATION_CLASSES
+LABEL_TO_CLASS = {0: SEGMENTATION_CLASSES.index("face"), 1: SEGMENTATION_CLASSES.index("plate")}
+
+
+def fetch_and_extract(raw_dir, zip_name, out_name):
+    out_dir = raw_dir / out_name
+    if out_dir.exists() and any(out_dir.iterdir()):
+        return out_dir
+    zip_path = raw_dir / "raw" / "data" / zip_name
+    if not zip_path.exists():
+        from huggingface_hub import hf_hub_download
+        hf_hub_download(HF_REPO, f"data/{zip_name}", repo_type="dataset", local_dir=raw_dir / "raw")
+    print(f"extracting {zip_path.name} ...")
+    with zipfile.ZipFile(zip_path) as z:
+        z.extractall(out_dir)
+    return out_dir
+
+
+def index_images(img_dir, ann_dir):
+    """One (image path, subset, label path or None) per image; the subset (city) is the image's folder name."""
+    labels = {(p.parent.name, p.stem): p for p in ann_dir.rglob("*.txt")}
+    return [(str(p), p.parent.name, str(labels[(p.parent.name, p.stem)]) if (p.parent.name, p.stem) in labels else None)
+            for p in sorted(q for q in img_dir.rglob("*") if q.suffix.lower() in IMG_EXTS)]
+
+
+def rasterise(label_path, W, H):
+    """Label lines are `class x_center y_center width height` as fractions of the image size. Each box is filled
+    with its class, rounded outwards to whole pixels; where boxes overlap, the later line wins."""
+    mask = np.zeros((H, W), np.uint8)
+    if label_path is None:
+        return mask
+    for line in Path(label_path).read_text().splitlines():
+        parts = line.split()
+        if len(parts) < 5:
+            continue
+        cls = LABEL_TO_CLASS[int(parts[0])]
+        cx, cy, bw, bh = map(float, parts[1:5])
+        x1, y1 = int(np.floor((cx - bw / 2) * W)), int(np.floor((cy - bh / 2) * H))
+        x2, y2 = int(np.ceil((cx + bw / 2) * W)), int(np.ceil((cy + bh / 2) * H))
+        mask[max(y1, 0):y2, max(x1, 0):x2] = cls
+    return mask
+
+
+def generate(items):
+    for img_path, subset, label_path in items:
+        raw = Path(img_path).read_bytes()        # stored as-is: no re-encoding of the image
+        H, W = cv2.imdecode(np.frombuffer(raw, np.uint8), cv2.IMREAD_UNCHANGED).shape[:2]
+        ok, png = cv2.imencode(".png", rasterise(label_path, W, H))
+        assert ok
+        yield dict(image_id=f"{subset}/{Path(img_path).stem}", source=SOURCE, subset=subset,
+                   image={"bytes": raw, "path": Path(img_path).name},
+                   mask={"bytes": png.tobytes(), "path": None})
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--save_dir", required=True, type=Path, help="data version directory, e.g. data/v1")
+    ap.add_argument("--raw_dir", type=Path, default=Path("data/raw/pp4av"), help="download / extraction cache")
+    ap.add_argument("--test_subsets", nargs="+", default=["switzerland", "strasbourg"],
+                    help="subsets (cities) that form the test split")
+    ap.add_argument("--num_proc", type=int, default=8)
+    ap.add_argument("--overwrite", action="store_true")
+    args = ap.parse_args()
+
+    img_dir = fetch_and_extract(args.raw_dir, "images.zip", "images")
+    ann_dir = fetch_and_extract(args.raw_dir, "annotations.zip", "annotations")
+    items = index_images(img_dir, ann_dir)
+    subsets = sorted({s for _, s, _ in items})
+    unknown = set(args.test_subsets) - set(subsets)
+    if unknown:
+        raise ValueError(f"unknown test subsets {sorted(unknown)}; PP4AV has {subsets}")
+
+    args.save_dir.mkdir(parents=True, exist_ok=True)
+    splits = dict(zip(split_names(SOURCE, "segmentation"), (
+        [it for it in items if it[1] not in args.test_subsets],
+        [it for it in items if it[1] in args.test_subsets],
+    )))
+    for name, split_items in splits.items():
+        out = args.save_dir / name
+        if out.exists():
+            if not args.overwrite:
+                raise FileExistsError(f"{out} exists (pass --overwrite to replace it)")
+            shutil.rmtree(out)
+        # build in a scratch cache next to the output, so the dataset is not left behind in ~/.cache
+        with tempfile.TemporaryDirectory(dir=args.save_dir) as cache:
+            ds = Dataset.from_generator(generate, features=SEGMENTATION_FEATURES, gen_kwargs={"items": split_items},
+                                        num_proc=min(args.num_proc, len(split_items)), cache_dir=cache)
+            ds.save_to_disk(str(out))
+        print(f"{out}: {len(ds)} images from {sorted({s for _, s, _ in split_items})}")
+
+
+if __name__ == "__main__":
+    main()

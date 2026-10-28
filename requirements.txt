@@ -1,0 +1,16 @@
+# MiTA-Segmenter (the `segm` package) is installed separately from its own repository
+torch
+numpy
+opencv-python
+pillow
+datasets
+huggingface_hub
+safetensors
+accelerate
+optuna
+tensorboard
+einops
+tomli; python_version < "3.11"
+# notebooks
+matplotlib
+pandas

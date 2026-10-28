@@ -1,0 +1,11 @@
+# generated: datasets, weights and logs stay out of git (folders are kept by .gitkeep)
+data/*
+!data/.gitkeep
+model_weights/*
+!model_weights/.gitkeep
+training_logs/*
+!training_logs/.gitkeep
+
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
