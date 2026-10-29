@@ -9,7 +9,8 @@ Training recipe (from pp4av_train.ipynb):
   the model's upscale (jittered by `scale_jitter`); with probability `object_crop_prob` it contains a random
   object (a connected region of non-background mask pixels); random horizontal flip and brightness/contrast
 - loss = cross-entropy + `dice_weight` * mean soft Dice over the non-background classes
-- MiTA-Segmenter's optimiser and polynomial schedule
+- MiTA-Segmenter's optimiser and polynomial schedule (planned over the full `epochs`, also when stopping early)
+- early stopping on the validation loss (see `train`)
 """
 import json
 import random
@@ -92,34 +93,62 @@ def dice_loss(logits, target, cls):
 
 @torch.no_grad()
 def evaluate(model, ds, batch_size=16, accelerator=None):
-    """Full-image sliding-window inference on `ds` -> per-class Dice and IoU of the argmax prediction,
-    summed over all pixels of all images. With an accelerator, each process takes a shard and counts are summed."""
+    """Full-image sliding-window inference on `ds` -> validation loss, and per-class Dice and IoU of the argmax
+    prediction, all summed over every pixel of every image. With an accelerator, each process takes a shard and
+    the sums are combined.
+
+    `loss` = cross-entropy + mean soft Dice loss over the non-background classes, with the Dice term weighted 1
+    whatever the run's `dice_weight`: it is what early stopping and optuna compare, so it keeps one scale."""
     n_cls = len(model.classes)
     if accelerator is not None and accelerator.num_processes > 1:
         ds = ds.shard(accelerator.num_processes, accelerator.process_index, contiguous=True)
     device = model.mean.device
-    counts = torch.zeros(3, n_cls, dtype=torch.float64, device=device)     # intersection, predicted, labelled
+    # rows: argmax intersection, argmax predicted, labelled, soft intersection, soft predicted; last column of
+    # row 0 holds the summed cross-entropy
+    sums = torch.zeros(5, n_cls + 1, dtype=torch.float64, device=device)
     was_training = model.training
     model.eval()
     for row in undecoded(ds):
         img, mask = decode_row(row)
-        pred = model.predict(img, batch_size=batch_size).argmax(0)
+        prob = model.predict(img, batch_size=batch_size)
+        pred = prob.argmax(0)
         target = torch.from_numpy(mask).to(device).long()
-        counts[0] += torch.bincount(target[pred == target], minlength=n_cls)[:n_cls].double()
-        counts[1] += torch.bincount(pred.flatten(), minlength=n_cls)[:n_cls].double()
-        counts[2] += torch.bincount(target.flatten(), minlength=n_cls)[:n_cls].double()
+        onehot = F.one_hot(target, n_cls).permute(2, 0, 1).float()
+        sums[0, :n_cls] += torch.bincount(target[pred == target], minlength=n_cls)[:n_cls].double()
+        sums[1, :n_cls] += torch.bincount(pred.flatten(), minlength=n_cls)[:n_cls].double()
+        sums[2, :n_cls] += torch.bincount(target.flatten(), minlength=n_cls)[:n_cls].double()
+        sums[3, :n_cls] += (prob * onehot).sum((1, 2)).double()
+        sums[4, :n_cls] += prob.sum((1, 2)).double()
+        sums[0, n_cls] += -torch.log(prob.gather(0, target[None]).clamp_min(1e-8)).sum().double()
     model.train(was_training)
     if accelerator is not None:
-        counts = accelerator.reduce(counts, reduction="sum")
-    inter, pred_n, true_n = counts.cpu().numpy()
+        sums = accelerator.reduce(sums, reduction="sum")
+    sums = sums.cpu().numpy()
+    ce_sum, sums = sums[0, n_cls], sums[:, :n_cls]
+    inter, pred_n, true_n, soft_inter, soft_pred = sums
     dice = 2 * inter / np.maximum(pred_n + true_n, 1)
     iou = inter / np.maximum(pred_n + true_n - inter, 1)
-    metrics = {}
+    soft_dice_loss = 1 - (2 * soft_inter + 1) / (soft_pred + true_n + 1)      # as dice_loss, over the whole set
+    metrics = dict(ce=float(ce_sum / max(true_n.sum(), 1)))
+    metrics["loss"] = metrics["ce"] + float(soft_dice_loss[1:].mean())
     for c, name in enumerate(model.classes):
         metrics[f"dice_{name}"], metrics[f"iou_{name}"] = float(dice[c]), float(iou[c])
     metrics["mean_dice"] = float(dice[1:].mean())          # over the non-background classes
     metrics["mean_iou"] = float(iou[1:].mean())
     return metrics
+
+
+def crosses(step, total, n):
+    """True at the steps that end each of `n` equal fractions of a `total`-step run (every step if n >= total)."""
+    return step * n // total > (step - 1) * n // total
+
+
+def loss_slope(history, window):
+    """Average change of the validation loss per evaluation over the last `window` evaluations
+    (negative = decreasing), or None until window + 1 evaluations exist."""
+    if window <= 0 or len(history) <= window:
+        return None
+    return (history[-1] - history[-1 - window]) / window
 
 
 def build_model(cfg):
@@ -139,9 +168,13 @@ def save_model(model, out_dir, cfg, state):
 
 
 def train(cfg, log_name=None, weights_dir=None, report=None):
-    """Train one model as configured. `report(metrics, epoch)` is called after each evaluation (optuna uses it
-    to prune). Returns the last validation metrics. Weights are saved to `weights_dir` after every epoch
-    unless it is None."""
+    """Train one model as configured. Returns the last validation metrics and the model.
+
+    Logging and evaluation happen `num_logs` / `num_evals` times over the planned run (`epochs`), so they fall
+    at the same share of training images whatever the batch size or device count. After each evaluation:
+    `report(metrics, eval_index)` is called (optuna uses it to prune), weights are saved to `weights_dir`
+    unless it is None, and training stops early once the validation loss falls by less than
+    `early_stopping_min_decrease` per evaluation, averaged over the last `early_stopping_window` evaluations."""
     if cfg["model_name"] != MODEL_NAME:
         raise ValueError(f"the segmentation trainer trains {MODEL_NAME!r}, config asks for {cfg['model_name']!r}")
     t = cfg["training"]
@@ -165,10 +198,11 @@ def train(cfg, log_name=None, weights_dir=None, report=None):
     )
     loader = accelerator.prepare(loader)                       # sharded across devices
     steps_per_epoch = len(loader)
+    total_steps = steps_per_epoch * t["epochs"]
     opt_args = SimpleNamespace(
         opt=t["opt"], lr=t["lr"], weight_decay=t["weight_decay"], momentum=t["momentum"],
         sched=t["sched"], poly_power=t["poly_power"], poly_step_size=t["poly_step_size"], min_lr=t["min_lr"],
-        epochs=t["epochs"], iter_max=steps_per_epoch * t["epochs"], iter_warmup=0.0,
+        epochs=t["epochs"], iter_max=total_steps, iter_warmup=0.0,
     )
     optimizer = create_optimizer(opt_args, model.net)
     lr_scheduler = create_scheduler(opt_args, optimizer)      # stepped per update via step_update, not prepared
@@ -180,55 +214,73 @@ def train(cfg, log_name=None, weights_dir=None, report=None):
     if writer:
         writer.add_text("config", "```toml\n" + Path(cfg["_path"]).read_text() + "\n```")
         writer.add_text("training", "```json\n" + json.dumps(t, indent=2) + "\n```")
-        accelerator.print(f"{len(train_ds)} train / {len(valid_ds)} valid images, {steps_per_epoch} steps per epoch "
-                          f"on {accelerator.num_processes} device(s); logs in {LOGS_ROOT / log_name}")
+        accelerator.print(f"{len(train_ds)} train / {len(valid_ds)} valid images, {steps_per_epoch} steps per epoch, "
+                          f"{total_steps} steps planned on {accelerator.num_processes} device(s); "
+                          f"evaluating every ~{total_steps / t['num_evals']:.0f} steps; logs in {LOGS_ROOT / log_name}")
+
+    def batches():
+        for epoch in range(t["epochs"]):
+            for batch in loader:
+                yield epoch, batch
 
     fg = list(enumerate(raw_model.classes))[1:]
-    state, metrics = dict(epoch=0, step=0), {}
+    # x axis of every TensorBoard curve: training images seen (the same for any batch size or device count)
+    state, metrics, history = dict(epoch=0, step=0, images=0, evals=0, stopped_early=None), {}, []
     acc = dict(loss=0.0, ce=0.0, **{f"dice_{n}": 0.0 for _, n in fg}, n=0, t=time.perf_counter())
     model.train()
     try:
-        while state["epoch"] < t["epochs"]:
-            for ims, masks in loader:
-                with accelerator.autocast():
-                    logits = model(ims)
-                logits = logits.float()
-                ce = F.cross_entropy(logits, masks)
-                dice = {name: dice_loss(logits, masks, c) for c, name in fg}
-                loss = ce + t["dice_weight"] * sum(dice.values()) / len(dice)
+        for state["epoch"], (ims, masks) in batches():
+            with accelerator.autocast():
+                logits = model(ims)
+            logits = logits.float()
+            ce = F.cross_entropy(logits, masks)
+            dice = {name: dice_loss(logits, masks, c) for c, name in fg}
+            loss = ce + t["dice_weight"] * sum(dice.values()) / len(dice)
 
-                optimizer.zero_grad(set_to_none=True)
-                accelerator.backward(loss)
-                optimizer.step()
-                state["step"] += 1
-                lr_scheduler.step_update(num_updates=state["step"])
+            optimizer.zero_grad(set_to_none=True)
+            accelerator.backward(loss)
+            optimizer.step()
+            state["step"] += 1
+            state["images"] += t["batch_size"] * accelerator.num_processes
+            lr_scheduler.step_update(num_updates=state["step"])
 
-                acc["loss"] += loss.item(); acc["ce"] += ce.item(); acc["n"] += 1
-                for name, d in dice.items():
-                    acc[f"dice_{name}"] += d.item()
-                if state["step"] % t["log_every"] == 0 and writer:
-                    n, dt = acc.pop("n"), time.perf_counter() - acc.pop("t")
-                    for k, v in acc.items():
-                        writer.add_scalar(f"train/{k}", v / n, state["step"])
-                    writer.add_scalar("train/lr", optimizer.param_groups[0]["lr"], state["step"])
-                    writer.add_scalar("perf/img_per_s", n * t["batch_size"] * accelerator.num_processes / dt, state["step"])
-                    if torch.cuda.is_available():
-                        writer.add_scalar("perf/gpu_mem_gb", torch.cuda.max_memory_allocated() / 1e9, state["step"])
-                    acc = dict({k: 0.0 for k in acc}, n=0, t=time.perf_counter())
-            state["epoch"] += 1
+            acc["loss"] += loss.item(); acc["ce"] += ce.item(); acc["n"] += 1
+            for name, d in dice.items():
+                acc[f"dice_{name}"] += d.item()
+            if crosses(state["step"], total_steps, t["num_logs"]) and writer:
+                n, dt = acc.pop("n"), time.perf_counter() - acc.pop("t")
+                for k, v in acc.items():
+                    writer.add_scalar(f"train/{k}", v / n, state["images"])
+                writer.add_scalar("train/lr", optimizer.param_groups[0]["lr"], state["images"])
+                writer.add_scalar("perf/img_per_s", n * t["batch_size"] * accelerator.num_processes / dt, state["images"])
+                if torch.cuda.is_available():
+                    writer.add_scalar("perf/gpu_mem_gb", torch.cuda.max_memory_allocated() / 1e9, state["images"])
+                acc = dict({k: 0.0 for k in acc}, n=0, t=time.perf_counter())
 
-            last = state["epoch"] == t["epochs"]
-            if state["epoch"] % t["eval_every"] == 0 or last:
-                metrics = evaluate(raw_model, valid_ds, t["eval_batch_size"], accelerator)
-                if writer:
-                    for k, v in metrics.items():
-                        writer.add_scalar(f"valid/{k}", v, state["step"])
-                    accelerator.print(f"epoch {state['epoch']}/{t['epochs']}  " +
-                                      "  ".join(f"{k} {v:.4f}" for k, v in metrics.items() if k.startswith("mean")))
-                if report is not None:
-                    report(metrics, state["epoch"])
+            if not crosses(state["step"], total_steps, t["num_evals"]):
+                continue
+            metrics = evaluate(raw_model, valid_ds, t["eval_batch_size"], accelerator)
+            state["evals"] += 1
+            history.append(metrics["loss"])
+            slope = loss_slope(history, t["early_stopping_window"])
+            if slope is not None and -slope < t["early_stopping_min_decrease"]:
+                state["stopped_early"] = (f"validation loss fell {-slope:.4g} per evaluation over the last "
+                                          f"{t['early_stopping_window']}, less than {t['early_stopping_min_decrease']}")
+            if writer:
+                for k, v in metrics.items():
+                    writer.add_scalar(f"valid/{k}", v, state["images"])
+                if slope is not None:
+                    writer.add_scalar("valid/loss_slope", slope, state["images"])
+                accelerator.print(f"eval {state['evals']}/{t['num_evals']} (epoch {state['epoch'] + 1}/{t['epochs']})  " +
+                                  "  ".join(f"{k} {v:.4f}" for k, v in metrics.items() if k in ("loss", "mean_dice", "mean_iou")) +
+                                  ("" if slope is None else f"  loss slope {slope:.4g}"))
             if weights_dir is not None and accelerator.is_main_process:
                 save_model(raw_model, weights_dir, cfg, dict(state, valid=metrics))
+            if report is not None:
+                report(metrics, state["evals"])
+            if state["stopped_early"]:
+                accelerator.print(f"early stop at step {state['step']}/{total_steps}: {state['stopped_early']}")
+                break
     except KeyboardInterrupt:
         accelerator.print("interrupted")
         if weights_dir is not None and accelerator.is_main_process:

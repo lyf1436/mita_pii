@@ -79,9 +79,44 @@ def suggest_params(trial, cfg):
         else:
             raise ValueError(f"[optuna.params] {name!r}: unknown type {kind!r}")
         cfg["training"][name] = value
-    if "epochs" in cfg["optuna"]:                # shorter runs while searching
-        cfg["training"]["epochs"] = cfg["optuna"]["epochs"]
+    return search_config(cfg)
+
+
+def search_config(cfg):
+    """cfg with [optuna.training_overrides] applied: [training] values used only while searching
+    (e.g. a larger early_stopping_min_decrease, so unpromising settings stop sooner)."""
+    cfg = copy.deepcopy(cfg)
+    for name, value in cfg["optuna"].get("training_overrides", {}).items():
+        if name not in cfg["training"]:
+            raise KeyError(f"[optuna.training_overrides] {name!r} is not a [training] key")
+        cfg["training"][name] = value
     return cfg
+
+
+def study_storage(cfg):
+    return cfg["optuna"].get("storage") or f"sqlite:///{LOGS_ROOT / model_id(cfg) / 'optuna.db'}"
+
+
+def apply_best_params(cfg):
+    """cfg with [training] keys replaced by the best completed trial of this config's optuna study.
+    Only the tuned parameters are taken; [optuna.training_overrides] are not."""
+    import optuna
+    db = LOGS_ROOT / model_id(cfg) / "optuna.db"
+    if not cfg["optuna"].get("storage") and not db.exists():
+        raise RuntimeError(f"no optuna study at {db}; run trainer.<task>_opt with this config first")
+    try:
+        study = optuna.load_study(study_name=model_id(cfg), storage=study_storage(cfg))
+        best = study.best_trial
+    except (KeyError, ValueError) as e:
+        raise RuntimeError(f"no completed optuna trial for {model_id(cfg)} in {study_storage(cfg)}; "
+                           f"run trainer.<task>_opt with this config first") from e
+    cfg = copy.deepcopy(cfg)
+    for name, value in best.params.items():
+        if name not in cfg["training"]:
+            raise KeyError(f"tuned parameter {name!r} is not a [training] key")
+        cfg["training"][name] = value
+    cfg["training"]["_best_trial"] = best.number
+    return cfg, best
 
 
 def launched_by_accelerate():

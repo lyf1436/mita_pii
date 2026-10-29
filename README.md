@@ -29,8 +29,11 @@ are indices into `SEGMENTATION_CLASSES` (`background`, `face`, `plate`).
 
 - top level: `version`, `dataset_paths` (merged by the trainer), `dataset_nickname`, `task_nickname`, `model_name`, `job_name`
 - `[classification]`: the classes the model outputs
-- `[training]`: everything the trainer reads (model, data split, augmentation, optimisation, logging)
-- `[optuna]`: search settings, and `[optuna.params]`, where each entry tunes the `[training]` key of the same name
+- `[training]`: everything the trainer reads (model, data split, augmentation, optimisation, logging, early stopping).
+  Logging and evaluation are given as counts over the planned run (`num_logs`, `num_evals`), not step intervals, so
+  they fall at the same share of training images for any batch size, and early stopping compares runs fairly
+- `[optuna]`: search settings; `[optuna.params]`, where each entry tunes the `[training]` key of the same name;
+  `[optuna.training_overrides]`, `[training]` values used only while searching (e.g. a larger early-stopping threshold)
 - `[accelerate]`: `num_devices`, `mixed_precision`
 
 ## Usage
@@ -46,8 +49,10 @@ python -m data_pipeline.pp4av_to_segmentation --save_dir data/v1
 # 2a. train (relaunches itself under `accelerate launch` when [accelerate] num_devices > 1)
 python -m trainer.segmentation_acc --config config/v1/segmentation.toml
 
-# 2b. or tune: one worker per device, sharing a study stored in training_logs/<model id>/optuna.db
+# 2b. or tune first (one worker per device, sharing a study stored in training_logs/<model id>/optuna.db),
+#     then train from scratch with the best trial's parameters
 python -m trainer.segmentation_opt --config config/v1/segmentation.toml
+python -m trainer.segmentation_acc --config config/v1/segmentation.toml --best_params
 
 tensorboard --logdir training_logs
 ```

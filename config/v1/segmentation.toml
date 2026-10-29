@@ -3,8 +3,9 @@
 #          = v1_pp4av_seg3_mita_segmentation_vit_tiny
 #   weights: model_weights/<model id>     logs: training_logs/<model id>
 #
-#   python -m trainer.segmentation_acc --config config/v1/segmentation.toml   # train
-#   python -m trainer.segmentation_opt --config config/v1/segmentation.toml   # tune
+#   python -m trainer.segmentation_acc --config config/v1/segmentation.toml                 # train
+#   python -m trainer.segmentation_opt --config config/v1/segmentation.toml                 # tune, then
+#   python -m trainer.segmentation_acc --config config/v1/segmentation.toml --best_params   # train with the best trial
 
 version = "v1"
 dataset_paths = ["data/v1/pp4av_segmentation_train"]   # merged by the trainer; relative to the repo root
@@ -42,22 +43,32 @@ sched = "polynomial"
 poly_power = 0.9
 poly_step_size = 1
 min_lr = 1e-5
-epochs = 64
+epochs = 64                   # planned length: sets the schedule and the log/eval spacing; may stop earlier
 batch_size = 8                # per device
 dice_weight = 1.0             # loss = CE + dice_weight * mean Dice over face and plate
 
-# logging / evaluation
-log_every = 20                # steps between TensorBoard records
-eval_every = 4                # epochs between full-image validation passes (always after the last epoch)
+# logging / evaluation: counts over the planned run, evenly spaced, so they land at the same share of
+# training images for any batch size or device count (TensorBoard's x axis is training images seen)
+num_logs = 1000               # TensorBoard training records
+num_evals = 32                # full-image validation passes (the last one at the end of the run)
 eval_batch_size = 16          # windows per forward pass during validation
+
+# early stopping on the validation loss (CE + mean Dice loss, Dice weighted 1 so runs share one scale):
+# stop when the loss fell by less than `min_decrease` per evaluation, averaged over the last `window` evaluations,
+# i.e. (loss[now - window] - loss[now]) / window < early_stopping_min_decrease. window = 0 turns it off.
+early_stopping_window = 4
+early_stopping_min_decrease = 0.001
 
 [optuna]
 n_trials = 20                 # total across workers and re-runs of the study (parallel workers may overshoot by a few)
 metric = "mean_dice"          # validation metric: mean_dice, mean_iou, dice_face, iou_plate, ...
 direction = "maximize"
-pruner = "median"             # "median" or "none"
-epochs = 16                   # replaces [training] epochs during the search
+pruner = "median"             # "median" or "none"; compares trials at the same evaluation
 # storage = "sqlite:///..."   # default: training_logs/<model id>/optuna.db
+
+# [training] values used only while searching
+[optuna.training_overrides]
+early_stopping_min_decrease = 0.005   # stop unpromising settings sooner than the final run does
 
 # each entry tunes the [training] key of the same name
 [optuna.params]

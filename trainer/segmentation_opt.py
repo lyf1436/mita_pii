@@ -2,8 +2,13 @@
 
     python -m trainer.segmentation_opt --config config/v1/segmentation.toml
 
-Each trial samples the [optuna.params] entries into [training] and runs an ordinary training run on one
-device, reporting the validation `metric` after each evaluation so unpromising trials are pruned.
+Each trial samples the [optuna.params] entries into [training], applies [optuna.training_overrides] (e.g. a
+larger early-stopping threshold), and runs an ordinary training run on one device, reporting the validation
+`metric` after each evaluation so unpromising trials are pruned.
+
+Afterwards, train the final model from scratch with the best parameters (and the [training] early stopping):
+
+    python -m trainer.segmentation_acc --config config/v1/segmentation.toml --best_params
 With [accelerate] num_devices > 1, one worker process per GPU runs trials in parallel on a shared study.
 
 The study is stored in training_logs/<model id>/optuna.db, so re-running continues it. Each trial logs to
@@ -19,7 +24,7 @@ import sys
 import optuna
 from optuna.trial import TrialState
 
-from trainer.common import LOGS_ROOT, REPO_ROOT, load_config, model_id, suggest_params
+from trainer.common import LOGS_ROOT, REPO_ROOT, load_config, model_id, study_storage, suggest_params
 from trainer.segmentation import default_weights_dir, save_model, train
 
 PRUNERS = {"median": optuna.pruners.MedianPruner, "none": optuna.pruners.NopPruner}
@@ -28,8 +33,7 @@ PRUNERS = {"median": optuna.pruners.MedianPruner, "none": optuna.pruners.NopPrun
 def create_study(cfg):
     o = cfg["optuna"]
     (LOGS_ROOT / model_id(cfg)).mkdir(parents=True, exist_ok=True)
-    storage = o.get("storage") or f"sqlite:///{LOGS_ROOT / model_id(cfg) / 'optuna.db'}"
-    return optuna.create_study(study_name=model_id(cfg), storage=storage, load_if_exists=True,
+    return optuna.create_study(study_name=model_id(cfg), storage=study_storage(cfg), load_if_exists=True,
                                direction=o["direction"], pruner=PRUNERS[o.get("pruner", "median")]())
 
 
