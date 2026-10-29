@@ -1,8 +1,8 @@
 """Prepare PP4AV (street images with face and licence-plate boxes) as segmentation data.
 
 Usage:
-    python -m data_pipeline.pp4av_to_segmentation --save_dir data/v1
-    python -m data_pipeline.pp4av_to_segmentation --save_dir data/v1 --raw_dir /data/pp4av --overwrite
+    python -m data_pipeline.pp4av_to_segmentation --save_dir data/v0_0_1
+    python -m data_pipeline.pp4av_to_segmentation --save_dir data/v0_0_1 --raw_dir /data/pp4av --overwrite
 
 Assumption: a labelled box is a close enough outline of a face or plate for blurring.
 
@@ -87,7 +87,7 @@ def generate(items):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--save_dir", required=True, type=Path, help="data version directory, e.g. data/v1")
+    ap.add_argument("--save_dir", required=True, type=Path, help="data version directory, e.g. data/v0_0_1")
     ap.add_argument("--raw_dir", type=Path, default=Path("data/raw/pp4av"), help="download / extraction cache")
     ap.add_argument("--test_subsets", nargs="+", default=["switzerland", "strasbourg"],
                     help="subsets (cities) that form the test split")

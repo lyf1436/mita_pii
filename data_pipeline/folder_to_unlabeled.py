@@ -1,8 +1,8 @@
 """Prepare any folder of images as unlabeled data, for trying a model on images it was neither trained nor tested on.
 
 Usage:
-    python -m data_pipeline.folder_to_unlabeled --input_dir /path/to/photos --save_dir data/v1
-    python -m data_pipeline.folder_to_unlabeled --input_dir /path/to/photos --save_dir data/v1 --source dashcam
+    python -m data_pipeline.folder_to_unlabeled --input_dir /path/to/photos --save_dir data/v0_0_1
+    python -m data_pipeline.folder_to_unlabeled --input_dir /path/to/photos --save_dir data/v0_0_1 --source dashcam
 
 Assumption: the images can sit in any number of nested folders, in mixed image formats, next to files that are
 not images.
@@ -44,7 +44,7 @@ def generate(paths, input_dir, source):
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--input_dir", required=True, type=Path, help="folder searched recursively for images")
-    ap.add_argument("--save_dir", required=True, type=Path, help="data version directory, e.g. data/v1")
+    ap.add_argument("--save_dir", required=True, type=Path, help="data version directory, e.g. data/v0_0_1")
     ap.add_argument("--source", help="dataset name prefix (default: the input folder's name)")
     ap.add_argument("--num_proc", type=int, default=8)
     ap.add_argument("--overwrite", action="store_true")

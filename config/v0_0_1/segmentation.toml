@@ -1,18 +1,18 @@
 # 3-class segmentation (background / face / plate) of PP4AV with MiTA-Segmenter.
 # model id = <version>_<dataset_nickname>_<task_nickname>_<model_name>_<job_name>
-#          = v1_pp4av_seg3_mita_segmentation_vit_tiny
+#          = v0_0_1_pp4av_seg3_mita_segmentation_tiny_test
 #   weights: model_weights/<model id>     logs: training_logs/<model id>
 #
-#   python -m trainer.segmentation_acc --config config/v1/segmentation.toml                 # train
-#   python -m trainer.segmentation_opt --config config/v1/segmentation.toml                 # tune, then
-#   python -m trainer.segmentation_acc --config config/v1/segmentation.toml --best_params   # train with the best trial
+#   python -m trainer.segmentation_acc --config config/v0_0_1/segmentation.toml                 # train
+#   python -m trainer.segmentation_opt --config config/v0_0_1/segmentation.toml                 # tune, then
+#   python -m trainer.segmentation_acc --config config/v0_0_1/segmentation.toml --best_params   # train with the best trial
 
-version = "v1"
-dataset_paths = ["data/v1/pp4av_segmentation_train"]   # merged into one training set; relative to the repository
+version = "v0_0_1"
+dataset_paths = ["data/v0_0_1/pp4av_segmentation_train"]   # merged into one training set; relative to the repository
 dataset_nickname = "pp4av"
 task_nickname = "seg3"
 model_name = "mita_segmentation"                       # the model this task trains
-job_name = "vit_tiny"
+job_name = "tiny_test"
 
 [classification]
 # model outputs, in the same order as the classes of the prepared segmentation data
@@ -73,9 +73,8 @@ early_stopping_min_decrease = 0.005   # stop unpromising settings sooner than th
 # each entry tunes the [training] key of the same name
 [optuna.params]
 lr = { type = "float", low = 3e-4, high = 1e-2, log = true }
+batch_size = { type = "categorical", choices = [4, 8, 16] }   # per device; 16 must fit in GPU memory
 dice_weight = { type = "float", low = 0.25, high = 4.0, log = true }
-object_crop_prob = { type = "float", low = 0.25, high = 0.9 }
-drop_path_rate = { type = "float", low = 0.0, high = 0.3 }
 
 [accelerate]
 num_devices = 1               # GPUs: training spreads one run over them; tuning runs one trial per GPU

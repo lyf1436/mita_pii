@@ -1,7 +1,7 @@
 """Search training settings for a segmentation model.
 
 Usage:
-    python -m trainer.segmentation_opt --config config/v1/segmentation.toml
+    python -m trainer.segmentation_opt --config config/v0_0_1/segmentation.toml
 
 Assumption: the config names the settings to search and their ranges, and one trial fits on one GPU.
 

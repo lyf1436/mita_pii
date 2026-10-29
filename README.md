@@ -35,7 +35,7 @@ Train a model that finds faces and license plates in street images, then use it 
 | `models/`, `trainer/` | the model and the training commands |
 
 The model id combines the config's `version`, `dataset_nickname`, `task_nickname`, `model_name` and `job_name`,
-e.g. `v1_pp4av_seg3_mita_segmentation_vit_tiny`.
+e.g. `v0_0_1_pp4av_seg3_mita_segmentation_tiny_test`.
 
 `data/`, `model_weights/` and `training_logs/` are not tracked by git.
 
@@ -54,26 +54,26 @@ Also install MiTA-Segmenter from its own repository. This repo does not include 
 ### 1. Prepare the data
 
 ```bash
-python -m data_pipeline.pp4av_to_segmentation --save_dir data/v1 --raw_dir /data/pp4av
+python -m data_pipeline.pp4av_to_segmentation --save_dir data/v0_0_1 --raw_dir /data/pp4av
 ```
 
 - `--raw_dir` is where PP4AV is downloaded to, about 4.5 GB. If you already downloaded it, point it there to reuse the download.
-- You get `data/v1/pp4av_segmentation_train` and `data/v1/pp4av_segmentation_test`. The command prints how many
+- You get `data/v0_0_1/pp4av_segmentation_train` and `data/v0_0_1/pp4av_segmentation_test`. The command prints how many
   images and which cities went into each.
 - If the folders already exist the command stops. Add `--overwrite` to rebuild them.
 
 Optional: your own images, to try the model on later.
 
 ```bash
-python -m data_pipeline.folder_to_unlabeled --input_dir /path/to/photos --save_dir data/v1
+python -m data_pipeline.folder_to_unlabeled --input_dir /path/to/photos --save_dir data/v0_0_1
 ```
 
-Every image in the folder and its subfolders ends up in `data/v1/photos_unlabeled` (named after the folder; set
+Every image in the folder and its subfolders ends up in `data/v0_0_1/photos_unlabeled` (named after the folder; set
 your own name with `--source`). Files that are not readable images are listed and left out.
 
 ### 2. Set up the experiment
 
-Open `config/v1/segmentation.toml` and decide:
+Open `config/v0_0_1/segmentation.toml` and decide:
 
 | setting | what to decide |
 |---|---|
@@ -89,7 +89,7 @@ Open `config/v1/segmentation.toml` and decide:
 The stopping thresholds in the config are starting guesses. Train once and look at the curves:
 
 ```bash
-python -m trainer.segmentation_acc --config config/v1/segmentation.toml
+python -m trainer.segmentation_acc --config config/v0_0_1/segmentation.toml
 tensorboard --logdir training_logs
 ```
 
@@ -103,7 +103,7 @@ You can press Ctrl-C once you have seen enough. The final run in step 5 replaces
 ### 4. Tune
 
 ```bash
-python -m trainer.segmentation_opt --config config/v1/segmentation.toml
+python -m trainer.segmentation_opt --config config/v0_0_1/segmentation.toml
 ```
 
 - Runs the configured number of trials, each with different settings. Weak trials are abandoned early.
@@ -114,7 +114,7 @@ python -m trainer.segmentation_opt --config config/v1/segmentation.toml
 ### 5. Train the final model
 
 ```bash
-python -m trainer.segmentation_acc --config config/v1/segmentation.toml --best_params
+python -m trainer.segmentation_acc --config config/v0_0_1/segmentation.toml --best_params
 ```
 
 - Trains from scratch with the best settings found in step 4, under the final stopping rule. It prints which
@@ -137,5 +137,5 @@ then run it top to bottom. You get:
 ### Next experiments
 
 - **Other settings, same data:** change `job_name`, then repeat steps 4 to 6.
-- **More data:** prepare the new source into a new version folder such as `data/v2`, add a config under
-  `config/v2/` that lists every dataset to train on, then repeat steps 3 to 6.
+- **More data:** prepare the new source into a new version folder such as `data/v0_0_2`, add a config under
+  `config/v0_0_2/` that lists every dataset to train on, then repeat steps 3 to 6.
