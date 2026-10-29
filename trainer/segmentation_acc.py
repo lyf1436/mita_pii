@@ -1,8 +1,8 @@
 """Train a segmentation model from a config, on one GPU or several.
 
 Usage:
-    python -m trainer.segmentation_acc --config config/v1/segmentation.toml
-    python -m trainer.segmentation_acc --config config/v1/segmentation.toml --best_params
+    python -m trainer.segmentation_acc --config config/v0_0_1/segmentation.toml
+    python -m trainer.segmentation_acc --config config/v0_0_1/segmentation.toml --best_params
 
 Assumption: the config's datasets exist. With --best_params, the experiment has already been searched.
 
