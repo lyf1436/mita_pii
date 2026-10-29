@@ -12,15 +12,14 @@ Usage:
 """
 import argparse
 import shutil
-import tempfile
 import zipfile
 from pathlib import Path
 
 import cv2
 import numpy as np
-from datasets import Dataset
 
 from data_pipeline.formats import SEGMENTATION_CLASSES, SEGMENTATION_FEATURES, split_names
+from data_pipeline.hf_save import save_generated
 
 HF_REPO = "khaclinh/pp4av"
 SOURCE = "pp4av"
@@ -108,11 +107,8 @@ def main():
             if not args.overwrite:
                 raise FileExistsError(f"{out} exists (pass --overwrite to replace it)")
             shutil.rmtree(out)
-        # build in a scratch cache next to the output, so the dataset is not left behind in ~/.cache
-        with tempfile.TemporaryDirectory(dir=args.save_dir) as cache:
-            ds = Dataset.from_generator(generate, features=SEGMENTATION_FEATURES, gen_kwargs={"items": split_items},
-                                        num_proc=min(args.num_proc, len(split_items)), cache_dir=cache)
-            ds.save_to_disk(str(out))
+        ds = save_generated(generate, SEGMENTATION_FEATURES, {"items": split_items}, out,
+                            num_proc=min(args.num_proc, len(split_items)))
         print(f"{out}: {len(ds)} images from {sorted({s for _, s, _ in split_items})}")
 
 

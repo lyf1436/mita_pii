@@ -13,14 +13,13 @@ Usage:
 """
 import argparse
 import shutil
-import tempfile
 from pathlib import Path
 
 import cv2
 import numpy as np
-from datasets import Dataset
 
 from data_pipeline.formats import UNLABELED_FEATURES
+from data_pipeline.hf_save import save_generated
 
 IMG_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".webp", ".tif", ".tiff"}
 
@@ -60,13 +59,8 @@ def main():
         if not args.overwrite:
             raise FileExistsError(f"{out} exists (pass --overwrite to replace it)")
         shutil.rmtree(out)
-    args.save_dir.mkdir(parents=True, exist_ok=True)
-    # build in a scratch cache next to the output, so the dataset is not left behind in ~/.cache
-    with tempfile.TemporaryDirectory(dir=args.save_dir) as cache:
-        ds = Dataset.from_generator(generate, features=UNLABELED_FEATURES,
-                                    gen_kwargs={"paths": paths, "input_dir": input_dir, "source": source},
-                                    num_proc=min(args.num_proc, len(paths)), cache_dir=cache)
-        ds.save_to_disk(str(out))
+    ds = save_generated(generate, UNLABELED_FEATURES, {"paths": paths, "input_dir": input_dir, "source": source},
+                        out, num_proc=min(args.num_proc, len(paths)))
 
     skipped = sorted(set(paths) - {str(input_dir / i) for i in ds["image_id"]})
     print(f"{out}: {len(ds)} images from {len(set(ds['subset']))} folder(s)")
