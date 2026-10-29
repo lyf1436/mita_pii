@@ -1,15 +1,22 @@
-"""MiTA-Segmenter for per-pixel classification (e.g. background / face / plate).
+"""MiTA-Segmenter as a per-pixel classifier, for any set of three or more classes.
 
-Wraps MiTA-Segmenter's `segm` package: a ViT encoder with MiTA attention (ImageNet-pretrained) and a
-mask-transformer decoder. Adds what the training notebook established:
+Assumption: MiTA-Segmenter is installed. Its attention accepts only inputs of exactly 32x32 or 40x40 patches, and
+its decoder was written for 150 classes.
 
-- the decoder attention patch that lets it run with any class count (MiTA hard-codes ADE20K's 150)
-- the geometry: every input is `grid` x `grid` patches, and images are upscaled so that one patch covers
-  `px_per_patch` original pixels
-- input normalisation inside `forward`, so callers pass uint8 images
-- `predict`: sliding-window inference on a full image, returning class probabilities at its resolution
-- `save` / `load` of a weights directory (config.json + model.safetensors)
-"""
+Expectation:
+- It takes ordinary 8-bit RGB images; normalisation happens inside.
+- It labels a full image of any size and returns each class's probability at that image's own resolution.
+- A saved model folder reloads into the same model, without downloading anything.
+
+Rationale:
+- Images are enlarged so that one patch covers a fixed number of original pixels: at native resolution most faces
+  and plates are smaller than a single patch.
+- A full image is labelled in tiles of the fixed input size, because the attention fixes that size; shrinking the
+  whole image to fit would erase small objects.
+- At least three classes are required: the decoder normalises each pixel's class scores, and with only two
+  classes the scores collapse to +1/-1, leaving nothing to learn from.
+- The decoder's 150-class limit is lifted by a replacement that is checked to give identical results at 150.
+- Reloading saved weights skips the ImageNet download, because those weights would be overwritten at once."""
 import contextlib
 import json
 import os
@@ -70,7 +77,7 @@ def _patch_decoder(d_model, n_heads, grid):
 
 @contextlib.contextmanager
 def _no_imagenet_download():
-    """create_segmenter always loads ImageNet weights; skip that when trained weights are loaded right after."""
+    """Build the network without fetching ImageNet weights, for when trained weights replace them right away."""
     names = ("load_pretrained", "load_custom_pretrained", "checkpoint_filter_fn")
     saved = {n: getattr(segm_factory, n) for n in names}
     saved_torch_load = torch.load
@@ -87,8 +94,7 @@ def _no_imagenet_download():
 
 
 def usable_backbones():
-    """Non-distilled ViTs in segm/config.yml: distilled DeiT models add a second extra token, which MiTA
-    attention does not accept."""
+    """Backbones the model accepts: distilled ones carry a second extra token, which the attention rejects."""
     return [name for name, m in load_config()["model"].items() if not m.get("distilled", False)]
 
 
@@ -135,15 +141,15 @@ class MitaSegmentation(nn.Module):
         self.register_buffer("std", torch.tensor(stats["std"]).view(1, 3, 1, 1) * 255, persistent=False)
 
     def forward(self, images):
-        """uint8 (or 0-255 float) [B, 3, input_size, input_size] -> class logits [B, n_cls, input_size, input_size]."""
+        """8-bit images of the input size -> class scores for every pixel."""
         return self.net((images.float() - self.mean) / self.std)
 
     @torch.no_grad()
     def predict(self, img_rgb, batch_size=16, amp_dtype=torch.bfloat16):
-        """RGB uint8 [H, W, 3] (numpy) -> class probabilities float32 [n_cls, H, W] at the original resolution.
+        """A full RGB image of any size -> each class's probability for every pixel, at the image's own resolution.
 
-        Upscales by `self.upscale`, runs the model on sliding windows of the input size (MiTA recipe: stride =
-        window), merges them and resizes back."""
+        The enlarged image is labelled tile by tile. Tiles do not overlap, except where the last tile of a row or column
+        is moved back to end at the image border; there the two results are averaged."""
         device = self.mean.device
         H, W = img_rgb.shape[:2]
         x = torch.from_numpy(np.ascontiguousarray(img_rgb)).permute(2, 0, 1)[None].to(device).float()

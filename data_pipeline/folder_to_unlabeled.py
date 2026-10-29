@@ -1,16 +1,18 @@
-"""Any folder of images -> one unlabeled Hugging Face dataset (e.g. for inference demos).
-
-Finds every image under --input_dir, in all subfolders, and saves them as-is (no re-encoding) to
-
-    <save_dir>/<source>_unlabeled
-
-with columns image_id (path relative to --input_dir), source, subset (the image's folder relative to
---input_dir) and image. Files that are not decodable images are skipped and listed.
+"""Prepare any folder of images as unlabeled data, for trying a model on images it was neither trained nor tested on.
 
 Usage:
     python -m data_pipeline.folder_to_unlabeled --input_dir /path/to/photos --save_dir data/v1
     python -m data_pipeline.folder_to_unlabeled --input_dir /path/to/photos --save_dir data/v1 --source dashcam
-"""
+
+Assumption: the images can sit in any number of nested folders, in mixed image formats, next to files that are
+not images.
+
+Expectation: one dataset holding every readable image under the folder, each remembering its path inside the
+folder. Files that cannot be read as images are skipped and listed instead of stopping the run.
+
+Rationale: images are stored byte for byte, so a demo shows exactly the original files. Unlabeled data becomes a
+single dataset rather than a train and test pair, because without labels it can be neither trained on nor
+scored."""
 import argparse
 import shutil
 from pathlib import Path

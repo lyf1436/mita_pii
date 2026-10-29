@@ -1,9 +1,13 @@
-"""Output formats shared by every data_pipeline script.
+"""The formats prepared datasets are saved in.
 
-A format fixes the columns and the label vocabulary, so datasets from different sources saved in the same
-format can be merged with `datasets.concatenate_datasets`. When a new source brings a new class, append it to
-the vocabulary: existing ids keep their meaning and older datasets stay mergeable.
-"""
+Assumption: whatever its source, every prepared dataset is saved in one of these formats.
+
+Expectation: two datasets in the same format can be merged as they are, and a label value means the same class
+in both.
+
+Rationale: the columns and the class list of a format are fixed in one place, so separately prepared sources
+cannot drift apart. A class list only grows by appending, so the classes already in it keep their values and
+datasets prepared earlier stay mergeable with newer ones."""
 from datasets import Features, Image, Value
 
 # segmentation: `mask` is a single-channel PNG whose pixel values are indices into this list
@@ -27,5 +31,5 @@ UNLABELED_FEATURES = Features({
 
 
 def split_names(source, fmt):
-    """The two dataset directories a source contributes to a data version: <source>_<format>_{train,test}."""
+    """Names of the train and test datasets that one source contributes in one format."""
     return f"{source}_{fmt}_train", f"{source}_{fmt}_test"

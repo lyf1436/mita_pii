@@ -1,13 +1,16 @@
-"""Train a segmentation model with accelerate on [accelerate] num_devices devices.
+"""Train a segmentation model from a config, on one GPU or several.
 
+Usage:
     python -m trainer.segmentation_acc --config config/v1/segmentation.toml
+    python -m trainer.segmentation_acc --config config/v1/segmentation.toml --best_params
 
-With num_devices > 1 the script relaunches itself under `accelerate launch`. Weights go to
-model_weights/<model id>, TensorBoard logs to training_logs/<model id>.
+Assumption: the config's datasets exist. With --best_params, the experiment has already been searched.
 
---best_params replaces the tuned [training] keys with the best trial of this config's optuna study
-(trainer.segmentation_opt); everything else, including early stopping, comes from [training].
-"""
+Expectation: the trained model in the experiment's weights folder and its curves in the experiment's logs folder.
+With several GPUs configured, the same command trains one run across all of them.
+
+Rationale: --best_params takes only the tuned values from the search. Everything else, including the stricter
+stopping rule, comes from the config, so the final model is trained from scratch under its own rules."""
 import argparse
 import os
 

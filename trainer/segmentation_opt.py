@@ -1,20 +1,20 @@
-"""Tune a segmentation model's [training] parameters with optuna.
+"""Search training settings for a segmentation model.
 
+Usage:
     python -m trainer.segmentation_opt --config config/v1/segmentation.toml
 
-Each trial samples the [optuna.params] entries into [training], applies [optuna.training_overrides] (e.g. a
-larger early-stopping threshold), and runs an ordinary training run on one device, reporting the validation
-`metric` after each evaluation so unpromising trials are pruned.
-With [accelerate] num_devices > 1, one worker process per GPU runs trials in parallel on a shared study.
+Assumption: the config names the settings to search and their ranges, and one trial fits on one GPU.
 
-The study is stored in training_logs/<model id>/optuna.db, so re-running continues it. Each trial logs to
-training_logs/<model id>/trial_<n>; the best trial's weights go to model_weights/<model id>, with its
-parameters in best_params.json.
+Expectation: a search that can be stopped and continued, curves for every trial, and the best trial's model and
+settings in the experiment's weights folder.
 
-Afterwards, train the final model from scratch with the best parameters (and the [training] early stopping):
-
-    python -m trainer.segmentation_acc --config config/v1/segmentation.toml --best_params
-"""
+Rationale:
+- A search only has to rank settings, not finish models. Trials therefore stop under a looser rule than final
+  training, and a trial that falls behind the others at the same point is abandoned.
+- Each trial uses one GPU. With several GPUs, trials run side by side: for many short runs that is simpler and
+  faster than spreading each trial over all of them.
+- The search is kept on disk, so running the command again continues it, and the configured number of trials
+  counts trials from earlier runs too."""
 import argparse
 import json
 import os

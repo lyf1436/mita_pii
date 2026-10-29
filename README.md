@@ -1,51 +1,47 @@
 # mita_pii: blur faces and license plates with MiTA-Segmenter
 
-`pp4av_eda.ipynb` and `pp4av_train.ipynb` are the prototypes that proved the approach. The code below is the same
-pipeline split into reusable parts.
+Train a model that finds faces and license plates in street images, then use it to blur them.
 
-## Layout
+`pp4av_eda.ipynb` and `pp4av_train.ipynb` are the prototypes that proved the approach works.
 
-| folder | holds | naming |
-|---|---|---|
-| `data_pipeline/` | one script per (source, format): fetch, preprocess, save as a Hugging Face dataset | `<source>_to_<format>.py` |
-| `data/` | version dirs; each holds mergeable datasets, two per source | `data/<version>/<source>_<format>_{train,test}` |
-| `models/` | one script per model | `mita_segmentation.py`, later `mita_bounding_box.py`, ... |
-| `trainer/` | one trainer per task, each with an optuna and an accelerate variant | `<task>.py`, `<task>_opt.py`, `<task>_acc.py` |
-| `config/` | version dirs, one TOML per task | `config/<version>/<task>.toml` |
-| `model_weights/` | one flat folder per model id | `config.json`, `model.safetensors`, `config.toml`, `train_state.json` |
-| `training_logs/` | one flat folder per model id (TensorBoard; optuna study and per-trial logs) | |
+## What to expect
 
-model id = `<version>_<dataset_nickname>_<task_nickname>_<model_name>_<job_name>` from the config.
+- **Assumption:** your images resemble street or dashcam footage, and faces and plates in them are often tiny,
+  smaller than 16 pixels.
+- **Expectation:** a trained model, a measure of how well it does on cities it never saw, and blurred images.
+- **Every result can be traced back:** one config file describes one experiment. Its weights and logs are saved
+  in folders named after it, so you can always tell which experiment produced a result.
 
-`data/`, `model_weights/` and `training_logs/` are git-ignored.
+## How the project is shaped, and why
 
-### Formats
+| decision | why |
+|---|---|
+| Data is prepared once per source, into versioned folders | Training only ever reads prepared data, so adding a source never changes training. A new version leaves the data of earlier experiments untouched. |
+| Every source gives a train part and a test part | Test images are held out from the start, so the test score always comes from images training never saw. |
+| PP4AV's test part is whole cities | Images from one city are frames of one video and many are near-duplicates. A random split would test on images almost identical to training ones. |
+| Prepared data of the same kind can be merged | A config lists the datasets to train on, so combining sources means editing a list. |
+| Tuning and final training are separate steps | Tuning tries many settings with short runs that stop early. The final model is trained from scratch with the best settings and a stricter stopping rule. |
+| Progress is counted in training images, not steps | Logging, validation and stopping fall at the same points of a run whatever the batch size or number of GPUs, so such runs are compared fairly. |
 
-`data_pipeline/formats.py` defines each format's columns and label ids, so datasets in the same format merge with
-`concatenate_datasets`. Segmentation: `image_id`, `source`, `subset`, `image`, and `mask`, a PNG whose pixel values
-are indices into `SEGMENTATION_CLASSES` (`background`, `face`, `plate`). Unlabeled: the same columns without `mask`,
-one dataset `<source>_unlabeled` per folder, for inference demos only.
+## Folders
 
-### Config sections
+| folder | what you find there |
+|---|---|
+| `data_pipeline/` | commands that prepare a data source |
+| `data/<version>/` | prepared datasets: `<source>_<format>_train` and `<source>_<format>_test` |
+| `config/<version>/` | one experiment config per task |
+| `model_weights/<model id>/` | the trained model, a copy of its config, and its final scores |
+| `training_logs/<model id>/` | TensorBoard curves, and the tuning search with one folder per trial |
+| `models/`, `trainer/` | the model and the training commands |
 
-- top level: `version`, `dataset_paths` (merged by the trainer), `dataset_nickname`, `task_nickname`, `model_name`, `job_name`
-- `[classification]`: the classes the model outputs
-- `[training]`: everything the trainer reads (model, data split, augmentation, optimisation, logging, early stopping).
-  Logging and evaluation are given as counts over the planned run (`num_logs`, `num_evals`), not step intervals, so
-  they fall at the same share of training images for any batch size, and early stopping compares runs fairly
-- `[optuna]`: search settings; `[optuna.params]`, where each entry tunes the `[training]` key of the same name;
-  `[optuna.training_overrides]`, `[training]` values used only while searching (e.g. a larger early-stopping threshold)
-- `[accelerate]`: `num_devices`, `mixed_precision`
+The model id combines the config's `version`, `dataset_nickname`, `task_nickname`, `model_name` and `job_name`,
+e.g. `v1_pp4av_seg3_mita_segmentation_vit_tiny`.
+
+`data/`, `model_weights/` and `training_logs/` are not tracked by git.
 
 ## Workflow
 
-An example run with the default config, `config/v1/segmentation.toml` (model id
-`v1_pp4av_seg3_mita_segmentation_vit_tiny`).
-
-Run every command from the repository root. The scripts import each other's folders (`data_pipeline`, `models`,
-`trainer`) as packages, and `python -m` finds them in the current folder. Paths inside a config are resolved from
-the repository, but command-line paths (`--config`, `--save_dir`, `--input_dir`, `--raw_dir`) are relative to the
-current folder.
+Run every command from the repository root.
 
 ### 0. Setup (once)
 
@@ -53,56 +49,56 @@ current folder.
 pip install -r requirements.txt
 ```
 
-MiTA-Segmenter's `segm` package must also be importable. Install it from its repository; this repo does not include it.
+Also install MiTA-Segmenter from its own repository. This repo does not include it.
 
-### 1. Build the datasets
+### 1. Prepare the data
 
 ```bash
 python -m data_pipeline.pp4av_to_segmentation --save_dir data/v1 --raw_dir /data/pp4av
 ```
 
-- `--raw_dir` is where PP4AV is downloaded and extracted (default `data/raw/pp4av`, about 4.5 GB). Point it at an
-  existing download (the notebooks used `/data/pp4av`) to skip downloading again.
-- Writes `data/v1/pp4av_segmentation_train` (every city except the test ones) and `data/v1/pp4av_segmentation_test`
-  (switzerland and strasbourg, set by `--test_subsets`), and prints the image count and cities of each.
-- Stops if the folders exist; add `--overwrite` to rebuild them.
+- `--raw_dir` is where PP4AV is downloaded to, about 4.5 GB. If you already downloaded it, point it there to reuse the download.
+- You get `data/v1/pp4av_segmentation_train` and `data/v1/pp4av_segmentation_test`. The command prints how many
+  images and which cities went into each.
+- If the folders already exist the command stops. Add `--overwrite` to rebuild them.
 
-Optional, unlabeled images for the inference demo:
+Optional: your own images, to try the model on later.
 
 ```bash
 python -m data_pipeline.folder_to_unlabeled --input_dir /path/to/photos --save_dir data/v1
 ```
 
-Every image under the folder and its subfolders goes into `data/v1/<folder name>_unlabeled` (`--source` sets the
-name). Files that cannot be read as images are skipped and listed.
+Every image in the folder and its subfolders ends up in `data/v1/photos_unlabeled` (named after the folder; set
+your own name with `--source`). Files that are not readable images are listed and left out.
 
-### 2. Edit the config
+### 2. Set up the experiment
 
-| key | what to decide |
+Open `config/v1/segmentation.toml` and decide:
+
+| setting | what to decide |
 |---|---|
-| `job_name` | changes the model id, so different experiments don't overwrite each other |
-| `[training] backbone` | e.g. `vit_small_patch16_384` |
-| `[training] epochs` | the longest a run may last; early stopping can end it sooner |
-| `[training] valid_subsets` | whole cities for validation, so it shares no near-duplicate frames with training; empty = a random `valid_fraction` |
-| `[optuna.params]` | what to tune, and the ranges |
-| `[accelerate] num_devices` | number of GPUs |
+| `job_name` | a name for this experiment, so it doesn't overwrite another one |
+| `backbone` | model size, e.g. `vit_small_patch16_384` |
+| `epochs` | the longest a run may last; runs usually stop earlier |
+| `valid_subsets` | cities to validate on. Leave empty to validate on a random tenth of the training images, which scores higher than real use. |
+| `[optuna.params]` | which settings to tune, and over what range |
+| `num_devices` | how many GPUs to use |
 
-### 3. Calibrate the early-stopping thresholds (recommended, once)
+### 3. Calibrate when runs stop (once)
 
-The default thresholds are guesses. Check them against one real run:
+The stopping thresholds in the config are starting guesses. Train once and look at the curves:
 
 ```bash
 python -m trainer.segmentation_acc --config config/v1/segmentation.toml
 tensorboard --logdir training_logs
 ```
 
-Look at `valid/loss_slope` (how fast the validation loss falls per evaluation) and `valid/mean_dice` (when it stops
-improving). Then set:
+- Find where `valid/mean_dice` stops improving, and read `valid/loss_slope` there.
+- Set the stopping threshold for final training (`early_stopping_min_decrease` in `[training]`) to roughly that
+  value.
+- Set the one for tuning (in `[optuna.training_overrides]`) a few times larger, so tuning runs stop sooner.
 
-- `[training] early_stopping_min_decrease`: roughly the slope where `mean_dice` flattens out
-- `[optuna.training_overrides] early_stopping_min_decrease`: a few times larger, so tuning trials stop sooner
-
-You can stop this run with Ctrl-C once you've seen enough; step 5 overwrites its weights.
+You can press Ctrl-C once you have seen enough. The final run in step 5 replaces this model.
 
 ### 4. Tune
 
@@ -110,52 +106,36 @@ You can stop this run with Ctrl-C once you've seen enough; step 5 overwrites its
 python -m trainer.segmentation_opt --config config/v1/segmentation.toml
 ```
 
-- Runs `n_trials` trials. Each samples `[optuna.params]`, applies `[optuna.training_overrides]` (the larger
-  threshold), and trains on one GPU. With `num_devices = N`, N trials run in parallel, one per GPU.
-- Optuna stops a trial early when its `metric` falls behind the others at the same evaluation.
-- Watch it: `tensorboard --logdir training_logs/<model id>` shows each trial as `trial_000`, `trial_001`, ...
-- The study is saved in `training_logs/<model id>/optuna.db`. The best trial's weights and `best_params.json` go to
-  `model_weights/<model id>/`.
-- Running the same command again continues the study. To search more, raise `n_trials` and run it again.
+- Runs the configured number of trials, each with different settings. Weak trials are abandoned early.
+- Watch them in TensorBoard: each trial appears as `trial_000`, `trial_001`, ...
+- The best trial's model and settings are saved to `model_weights/<model id>/`.
+- If interrupted, run the same command again to continue. To search longer, raise `n_trials` and run it again.
 
-### 5. Train the final model from scratch
+### 5. Train the final model
 
 ```bash
 python -m trainer.segmentation_acc --config config/v1/segmentation.toml --best_params
 ```
 
-- Uses the best trial's tuned values; everything else, including the smaller early-stopping threshold, comes from
-  `[training]`. It prints which trial it took.
-- Trains on `num_devices` GPUs, relaunching itself under `accelerate launch` when there is more than one.
-- Replaces `model_weights/<model id>/` with this run:
-  - `config.json`, `model.safetensors`: the model
-  - `config.toml`: a copy of the config
-  - `train_state.json`: step, images seen, final validation scores, the trial used (`_best_trial`), and why it
-    stopped (`stopped_early`, empty if it ran all epochs)
-- Its TensorBoard curves are at the top level of `training_logs/<model id>/`, next to the trial folders.
+- Trains from scratch with the best settings found in step 4, under the final stopping rule. It prints which
+  trial's settings it used.
+- The model in `model_weights/<model id>/` is replaced by this one. `train_state.json` there records its scores,
+  the trial its settings came from, and why it stopped.
 
-### 6. Evaluate and use the model
+### 6. Check and use the model
 
-Open `segmentation_inference.ipynb`, set `WEIGHTS_DIR = "model_weights/<model id>"`, `TEST_PATHS`, and optionally
-`UNLABELED_PATHS` (e.g. `["data/v1/photos_unlabeled"]`), then run it top to bottom. It shows:
+Open `segmentation_inference.ipynb`. Set the weights folder, the test data and, optionally, your unlabeled data,
+then run it top to bottom. You get:
 
-1. test Dice and IoU next to the validation scores from training. A large gap means validation was too easy (e.g.
-   near-duplicate frames); set `valid_subsets` if so
-2. the test images with the most faces and plates: input, P(private), blurred result
-3. close-ups of individual faces and plates, before and after blurring
-4. random unlabeled images: prediction and blurred result
-5. any image file: set `IMAGE_PATH` (and `OUTPUT_PATH` to save the result)
+1. test scores next to the validation scores from training. If test is much lower, validation was too easy: name
+   validation cities in step 2 and train again.
+2. the test images with the most faces and plates, before and after blurring
+3. close-ups of single faces and plates, before and after blurring
+4. random images of your own, before and after blurring
+5. any single image file, blurred and optionally saved
 
-### Later experiments
+### Next experiments
 
-- **Another setting on the same data:** change `job_name` and repeat steps 4–6.
-- **New data:** write `data_pipeline/<source>_to_segmentation.py` and run it with `--save_dir data/v2`, add
-  `config/v2/segmentation.toml` with every train split to merge in `dataset_paths`, and repeat steps 3–6.
-
-## Adding things
-
-- **a source**: `data_pipeline/<source>_to_<format>.py` writes `<save_dir>/<source>_<format>_{train,test}` with the
-  format's features. List the new train split in the config's `dataset_paths`.
-- **a task** (e.g. bounding boxes): add its format to `formats.py`, a model in `models/`, `trainer/<task>{,_acc,_opt}.py`
-  and `config/<version>/<task>.toml`. `trainer/common.py` (config, model id, merging, splitting, optuna sampling,
-  multi-device launch) is task-independent.
+- **Other settings, same data:** change `job_name`, then repeat steps 4 to 6.
+- **More data:** prepare the new source into a new version folder such as `data/v2`, add a config under
+  `config/v2/` that lists every dataset to train on, then repeat steps 3 to 6.

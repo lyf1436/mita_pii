@@ -1,15 +1,22 @@
-"""PP4AV -> segmentation format (background / face / plate masks, boxes filled in).
-
-Downloads the PP4AV zips from Hugging Face once, rasterises each image's boxes into a class mask at the original
-resolution, and saves two Hugging Face datasets into the data version directory:
-
-    <save_dir>/pp4av_segmentation_train    every subset except --test_subsets
-    <save_dir>/pp4av_segmentation_test     whole held-out subsets (frames within a city are near-duplicates,
-                                           so a random split would leak; see pp4av_eda.ipynb)
+"""Prepare PP4AV (street images with face and licence-plate boxes) as segmentation data.
 
 Usage:
     python -m data_pipeline.pp4av_to_segmentation --save_dir data/v1
-"""
+    python -m data_pipeline.pp4av_to_segmentation --save_dir data/v1 --raw_dir /data/pp4av --overwrite
+
+Assumption: a labelled box is a close enough outline of a face or plate for blurring.
+
+Expectation: a train part and a test part in the data version folder. Every image comes with a mask that marks
+each pixel as background, face or plate. The test part consists of whole cities the train part never contains.
+
+Rationale:
+- Boxes are filled in as masks because everything inside a box is to be blurred. Box edges are rounded outwards,
+  so no edge pixel of a face or plate is left unmarked.
+- Whole cities are held out for testing: the images of one city are frames of one driving video and many are
+  near-duplicates, so a random split would put almost the same image on both sides and overstate test quality.
+- Masks are kept at the original image resolution, so the labels do not depend on how training later crops or
+  scales the images.
+- The source archives are downloaded and unpacked once and reused on later runs."""
 import argparse
 import shutil
 import zipfile
@@ -43,15 +50,15 @@ def fetch_and_extract(raw_dir, zip_name, out_name):
 
 
 def index_images(img_dir, ann_dir):
-    """One (image path, subset, label path or None) per image; the subset (city) is the image's folder name."""
+    """One entry per image: its path, its city, and its label file if it has one."""
     labels = {(p.parent.name, p.stem): p for p in ann_dir.rglob("*.txt")}
     return [(str(p), p.parent.name, str(labels[(p.parent.name, p.stem)]) if (p.parent.name, p.stem) in labels else None)
             for p in sorted(q for q in img_dir.rglob("*") if q.suffix.lower() in IMG_EXTS)]
 
 
 def rasterise(label_path, W, H):
-    """Label lines are `class x_center y_center width height` as fractions of the image size. Each box is filled
-    with its class, rounded outwards to whole pixels; where boxes overlap, the later line wins."""
+    """Mark every labelled box with its class over the whole image, rounding box edges outwards. Where boxes
+    overlap, the box listed later wins."""
     mask = np.zeros((H, W), np.uint8)
     if label_path is None:
         return mask

@@ -1,5 +1,20 @@
-"""Task-independent trainer plumbing: config loading, model id, folder layout, dataset merging and splitting,
-optuna parameter sampling, multi-device launch."""
+"""The task-independent parts of training: reading a config, naming its results, merging and splitting its data,
+sampling tuned values, and spreading one command over several devices.
+
+Assumption: a config describes one experiment completely, and its identifying fields differ between experiments.
+
+Expectation: the same config always gives the same model id, the same results folders and the same
+train/validation split.
+
+Rationale:
+- The model id is built from the config's identifying fields, so any weights or logs folder can be traced back to
+  the experiment that made it.
+- Paths inside a config are read relative to the repository, so a config means the same thing wherever a command
+  is started.
+- Every tuned value must replace an existing training setting. A tuned run is then an ordinary run with other
+  values, and the best values can be reused unchanged for a final run.
+- Search-only settings apply while tuning only, so a search can cut runs shorter than a final run does, without
+  the final run inheriting that."""
 import copy
 import os
 import subprocess
@@ -35,7 +50,7 @@ def model_id(cfg):
 
 
 def resolve(path):
-    """Config paths are relative to the repository root."""
+    """Paths inside a config are relative to the repository."""
     path = Path(path)
     return path if path.is_absolute() else REPO_ROOT / path
 
@@ -47,8 +62,8 @@ def load_merged_dataset(paths):
 
 
 def train_valid_split(ds, valid_fraction, valid_subsets=(), seed=0):
-    """Whole `subset`s if `valid_subsets` is given (no near-duplicate frames shared with training),
-    otherwise a seeded random `valid_fraction` of the rows."""
+    """Validation is the named groups if any are given, so near-duplicate frames never end up on both sides;
+    otherwise a random share of the rows, the same on every run."""
     if valid_subsets:
         subsets = ds["subset"]
         unknown = set(valid_subsets) - set(subsets)
@@ -61,10 +76,10 @@ def train_valid_split(ds, valid_fraction, valid_subsets=(), seed=0):
 
 
 def suggest_params(trial, cfg):
-    """[optuna.params] entries -> a copy of cfg with those [training] keys replaced by sampled values.
+    """A copy of the config with each tuned setting replaced by a value sampled for this trial, and the
+    search-only settings applied.
 
-    Each entry: {type = "float" | "int", low, high, log = false, step} or {type = "categorical", choices}.
-    Every tuned name must be an existing [training] key, so a tuned run is an ordinary training run."""
+    Each range is {type = "float" | "int", low, high, log = false, step} or {type = "categorical", choices}."""
     cfg = copy.deepcopy(cfg)
     for name, spec in cfg["optuna"].get("params", {}).items():
         if name not in cfg["training"]:
@@ -83,8 +98,7 @@ def suggest_params(trial, cfg):
 
 
 def search_config(cfg):
-    """cfg with [optuna.training_overrides] applied: [training] values used only while searching
-    (e.g. a larger early_stopping_min_decrease, so unpromising settings stop sooner)."""
+    """A copy of the config with the search-only settings applied."""
     cfg = copy.deepcopy(cfg)
     for name, value in cfg["optuna"].get("training_overrides", {}).items():
         if name not in cfg["training"]:
@@ -98,8 +112,8 @@ def study_storage(cfg):
 
 
 def apply_best_params(cfg):
-    """cfg with [training] keys replaced by the best completed trial of this config's optuna study.
-    Only the tuned parameters are taken; [optuna.training_overrides] are not."""
+    """A copy of the config with the tuned settings taken from the best finished trial of this experiment's
+    search. Search-only settings are not taken: a final run keeps its own."""
     import optuna
     db = LOGS_ROOT / model_id(cfg) / "optuna.db"
     if not cfg["optuna"].get("storage") and not db.exists():
@@ -124,7 +138,7 @@ def launched_by_accelerate():
 
 
 def relaunch_with_accelerate(module, num_devices, mixed_precision):
-    """Re-run `python -m module <same args>` under `accelerate launch` on `num_devices` processes."""
+    """Start this same command again as one process per device, wait for it, and exit with its result."""
     cmd = [sys.executable, "-m", "accelerate.commands.launch", "--num_processes", str(num_devices),
            "--mixed_precision", mixed_precision]
     if num_devices > 1:

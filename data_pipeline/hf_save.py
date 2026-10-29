@@ -1,4 +1,13 @@
-"""Build a Hugging Face dataset from a generator and save it, without leaving a copy in ~/.cache."""
+"""Saving a dataset that is built row by row.
+
+Assumption: the dataset can be too large to hold in memory, so it is built on disk before it is saved.
+
+Expectation: afterwards only the saved dataset remains: no build copy is left in the home cache or next to the
+output. If the build copy cannot be removed, the save still counts as done and the leftover folder is reported.
+
+Rationale: building in a scratch folder next to the output keeps the large intermediate copy on the same disk as
+the result, and out of the home folder. The built dataset is released before its scratch folder is deleted,
+because some network filesystems refuse to delete files that are still open."""
 import gc
 import shutil
 import tempfile
@@ -8,8 +17,7 @@ from datasets import Dataset, load_from_disk
 
 
 def save_generated(generator, features, gen_kwargs, out_dir, num_proc=1):
-    """Run `generator(**gen_kwargs)` into a scratch cache next to `out_dir`, save the result to `out_dir`,
-    delete the cache, and return the saved dataset (loaded from `out_dir`)."""
+    """Build a dataset from the generator's rows, save it to the output folder, and return the saved dataset."""
     out_dir = Path(out_dir)
     out_dir.parent.mkdir(parents=True, exist_ok=True)
     cache = Path(tempfile.mkdtemp(prefix=f".{out_dir.name}_build_", dir=out_dir.parent))

@@ -1,17 +1,27 @@
-"""Segmentation trainer for models.mita_segmentation, shared by segmentation_acc (accelerate) and
-segmentation_opt (optuna).
+"""Training and validation of a per-pixel segmentation model.
 
-`train(cfg)` merges the [dataset_paths], splits off validation data, trains with an accelerate loop, logs
-to TensorBoard in training_logs/<log_name>, evaluates on full validation images, and saves the model.
+Assumption: the data is in the segmentation format, and the classes other than background are rare and small:
+faces and plates cover a fraction of a percent of the pixels.
 
-Training recipe (from pp4av_train.ipynb):
-- each sample is a square window of the original image, sized so that resizing it to the model input gives
-  the model's upscale (jittered by `scale_jitter`); with probability `object_crop_prob` it contains a random
-  object (a connected region of non-background mask pixels); random horizontal flip and brightness/contrast
-- loss = cross-entropy + `dice_weight` * mean soft Dice over the non-background classes
-- MiTA-Segmenter's optimiser and polynomial schedule (planned over the full `epochs`, also when stopping early)
-- early stopping on the validation loss (see `train`)
-"""
+Expectation:
+- Logging, validation and stopping happen at the same shares of training images whatever the batch size or
+  number of devices, so runs that differ in those are compared fairly.
+- Validation scores what inference would produce: whole validation images, labelled at full resolution.
+- The model is saved after every validation, so a run that is interrupted or stopped keeps its latest state.
+- A run stops once its validation loss is no longer falling fast enough.
+
+Rationale:
+- Training crops are cut so that, once resized to the input size, objects appear at the scale used at inference,
+  with some random variation for robustness.
+- Some crops are placed around an object: random crops would almost always contain background only.
+- The loss adds a Dice term per object class to cross-entropy. Cross-entropy counts pixels, so background
+  dominates it; Dice scores each class by overlap, whatever its size.
+- The validation loss weighs the Dice term by 1 whatever weight training uses, so runs trained with different
+  weights are compared on one scale.
+- Stopping looks at the average fall of the validation loss over several validations rather than one comparison,
+  so a single noisy validation does not end a run.
+- The learning-rate schedule is planned over the full run even when the run stops early, so the possibility of
+  stopping does not change how training proceeds before it."""
 import json
 import random
 import shutil
@@ -37,14 +47,14 @@ cv2.setNumThreads(0)                     # let DataLoader workers parallelise, n
 
 
 def decode_row(row):
-    """Row with undecoded image/mask -> RGB uint8 [H, W, 3], class-index uint8 [H, W]."""
+    """A stored row -> the RGB image and its class mask."""
     img = cv2.imdecode(np.frombuffer(row["image"]["bytes"], np.uint8), cv2.IMREAD_COLOR)
     mask = cv2.imdecode(np.frombuffer(row["mask"]["bytes"], np.uint8), cv2.IMREAD_UNCHANGED)
     return cv2.cvtColor(img, cv2.COLOR_BGR2RGB), mask
 
 
 def undecoded(ds):
-    """Images and masks as raw bytes: decoded with OpenCV in the workers instead of PIL."""
+    """The dataset with images and masks left as stored bytes, so the loading workers decode them in parallel."""
     return ds.cast_column("image", HFImage(decode=False)).cast_column("mask", HFImage(decode=False))
 
 
@@ -93,12 +103,11 @@ def dice_loss(logits, target, cls):
 
 @torch.no_grad()
 def evaluate(model, ds, batch_size=16, accelerator=None):
-    """Full-image sliding-window inference on `ds` -> validation loss, and per-class Dice and IoU of the argmax
-    prediction, all summed over every pixel of every image. With an accelerator, each process takes a shard and
-    the sums are combined.
+    """Label every image in the dataset at full resolution and score the result: validation loss, and Dice and IoU
+    per class, counted over all pixels of all images. Across several devices each takes a share of the images and
+    the counts are combined.
 
-    `loss` = cross-entropy + mean soft Dice loss over the non-background classes, with the Dice term weighted 1
-    whatever the run's `dice_weight`: it is what early stopping and optuna compare, so it keeps one scale."""
+    The loss weighs the Dice term by 1 whatever weight training uses, so it keeps one scale across runs."""
     n_cls = len(model.classes)
     if accelerator is not None and accelerator.num_processes > 1:
         ds = ds.shard(accelerator.num_processes, accelerator.process_index, contiguous=True)
@@ -139,13 +148,13 @@ def evaluate(model, ds, batch_size=16, accelerator=None):
 
 
 def crosses(step, total, n):
-    """True at the steps that end each of `n` equal fractions of a `total`-step run (every step if n >= total)."""
+    """Whether this step ends one of n equal parts of the run (every step if the run is shorter than n)."""
     return step * n // total > (step - 1) * n // total
 
 
 def loss_slope(history, window):
-    """Average change of the validation loss per evaluation over the last `window` evaluations
-    (negative = decreasing), or None until window + 1 evaluations exist."""
+    """Average change of the validation loss per validation over the last few validations (negative = falling),
+    or None while there are too few."""
     if window <= 0 or len(history) <= window:
         return None
     return (history[-1] - history[-1 - window]) / window
@@ -168,13 +177,12 @@ def save_model(model, out_dir, cfg, state):
 
 
 def train(cfg, log_name=None, weights_dir=None, report=None):
-    """Train one model as configured. Returns the last validation metrics and the model.
+    """Train one model as configured and return its last validation scores and the model.
 
-    Logging and evaluation happen `num_logs` / `num_evals` times over the planned run (`epochs`), so they fall
-    at the same share of training images whatever the batch size or device count. After each evaluation:
-    `report(metrics, eval_index)` is called (optuna uses it to prune), weights are saved to `weights_dir`
-    unless it is None, and training stops early once the validation loss falls by less than
-    `early_stopping_min_decrease` per evaluation, averaged over the last `early_stopping_window` evaluations."""
+    Logging and validation happen a fixed number of times over the planned run. After each validation the scores go
+    to the callback if one is given (it may end the run by raising), the model is saved if a folder is given, and the
+    run stops once the validation loss falls by less than the configured amount per validation, averaged over the
+    configured number of validations."""
     if cfg["model_name"] != MODEL_NAME:
         raise ValueError(f"the segmentation trainer trains {MODEL_NAME!r}, config asks for {cfg['model_name']!r}")
     t = cfg["training"]
