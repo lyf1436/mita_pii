@@ -5,15 +5,15 @@
 Each trial samples the [optuna.params] entries into [training], applies [optuna.training_overrides] (e.g. a
 larger early-stopping threshold), and runs an ordinary training run on one device, reporting the validation
 `metric` after each evaluation so unpromising trials are pruned.
-
-Afterwards, train the final model from scratch with the best parameters (and the [training] early stopping):
-
-    python -m trainer.segmentation_acc --config config/v1/segmentation.toml --best_params
 With [accelerate] num_devices > 1, one worker process per GPU runs trials in parallel on a shared study.
 
 The study is stored in training_logs/<model id>/optuna.db, so re-running continues it. Each trial logs to
 training_logs/<model id>/trial_<n>; the best trial's weights go to model_weights/<model id>, with its
 parameters in best_params.json.
+
+Afterwards, train the final model from scratch with the best parameters (and the [training] early stopping):
+
+    python -m trainer.segmentation_acc --config config/v1/segmentation.toml --best_params
 """
 import argparse
 import json

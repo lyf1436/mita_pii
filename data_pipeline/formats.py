@@ -17,6 +17,14 @@ SEGMENTATION_FEATURES = Features({
     "mask": Image(),
 })
 
+# unlabeled: images only, e.g. for inference demos; same columns as segmentation minus the mask
+UNLABELED_FEATURES = Features({
+    "image_id": Value("string"),   # path relative to the input folder
+    "source": Value("string"),
+    "subset": Value("string"),     # the image's folder, relative to the input folder ("" at the top level)
+    "image": Image(),
+})
+
 
 def split_names(source, fmt):
     """The two dataset directories a source contributes to a data version: <source>_<format>_{train,test}."""

@@ -23,7 +23,8 @@ model id = `<version>_<dataset_nickname>_<task_nickname>_<model_name>_<job_name>
 
 `data_pipeline/formats.py` defines each format's columns and label ids, so datasets in the same format merge with
 `concatenate_datasets`. Segmentation: `image_id`, `source`, `subset`, `image`, and `mask`, a PNG whose pixel values
-are indices into `SEGMENTATION_CLASSES` (`background`, `face`, `plate`).
+are indices into `SEGMENTATION_CLASSES` (`background`, `face`, `plate`). Unlabeled: the same columns without `mask`,
+one dataset `<source>_unlabeled` per folder, for inference demos only.
 
 ### Config sections
 
@@ -46,6 +47,9 @@ pip install -r requirements.txt
 # 1. data: writes data/v1/pp4av_segmentation_train and data/v1/pp4av_segmentation_test
 python -m data_pipeline.pp4av_to_segmentation --save_dir data/v1
 
+# 1b. optional: any folder of images (searched recursively) as unlabeled demo data -> data/v1/<name>_unlabeled
+python -m data_pipeline.folder_to_unlabeled --input_dir /path/to/photos --save_dir data/v1
+
 # 2a. train (relaunches itself under `accelerate launch` when [accelerate] num_devices > 1)
 python -m trainer.segmentation_acc --config config/v1/segmentation.toml
 
@@ -58,7 +62,7 @@ tensorboard --logdir training_logs
 ```
 
 3. Inference: `segmentation_inference.ipynb` loads `model_weights/<model id>` and reports test metrics. It also shows
-   examples and anonymizes any image file.
+   examples, runs the model on the unlabeled datasets listed in `UNLABELED_PATHS`, and anonymizes any image file.
 
 Run everything from the repository root. Config paths are relative to it.
 
