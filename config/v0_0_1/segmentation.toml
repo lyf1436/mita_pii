@@ -3,9 +3,10 @@
 #          = v0_0_1_pp4av_seg3_mita_segmentation_tiny_test
 #   weights: model_weights/<model id>     logs: training_logs/<model id>
 #
-#   python -m trainer.segmentation_acc --config config/v0_0_1/segmentation.toml                 # train
-#   python -m trainer.segmentation_opt --config config/v0_0_1/segmentation.toml                 # tune, then
-#   python -m trainer.segmentation_acc --config config/v0_0_1/segmentation.toml --best_params   # train with the best trial
+#   python -m trainer.segmentation_acc --config config/v0_0_1/segmentation.toml   # train
+#   python -m trainer.segmentation_opt --config config/v0_0_1/segmentation.toml   # tune
+# For the final run, write a new config with the best trial's settings (best_params.json in the weights folder)
+# and a new job_name, and train it.
 
 version = "v0_0_1"
 dataset_paths = ["data/v0_0_1/pp4av_segmentation_train"]   # merged into one training set; relative to the repository

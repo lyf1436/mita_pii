@@ -111,28 +111,6 @@ def study_storage(cfg):
     return cfg["optuna"].get("storage") or f"sqlite:///{LOGS_ROOT / model_id(cfg) / 'optuna.db'}"
 
 
-def apply_best_params(cfg):
-    """A copy of the config with the tuned settings taken from the best finished trial of this experiment's
-    search. Search-only settings are not taken: a final run keeps its own."""
-    import optuna
-    db = LOGS_ROOT / model_id(cfg) / "optuna.db"
-    if not cfg["optuna"].get("storage") and not db.exists():
-        raise RuntimeError(f"no optuna study at {db}; run trainer.<task>_opt with this config first")
-    try:
-        study = optuna.load_study(study_name=model_id(cfg), storage=study_storage(cfg))
-        best = study.best_trial
-    except (KeyError, ValueError) as e:
-        raise RuntimeError(f"no completed optuna trial for {model_id(cfg)} in {study_storage(cfg)}; "
-                           f"run trainer.<task>_opt with this config first") from e
-    cfg = copy.deepcopy(cfg)
-    for name, value in best.params.items():
-        if name not in cfg["training"]:
-            raise KeyError(f"tuned parameter {name!r} is not a [training] key")
-        cfg["training"][name] = value
-    cfg["training"]["_best_trial"] = best.number
-    return cfg, best
-
-
 def launched_by_accelerate():
     return "LOCAL_RANK" in os.environ or "ACCELERATE_LAUNCHED" in os.environ
 
