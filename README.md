@@ -98,7 +98,7 @@ tensorboard --logdir training_logs
   value.
 - Set the one for tuning (in `[optuna.training_overrides]`) a few times larger, so tuning runs stop sooner.
 
-You can press Ctrl-C once you have seen enough. The final run in step 5 replaces this model.
+You can press Ctrl-C once you have seen enough. Tuning in step 4 replaces this model.
 
 ### 4. Tune
 
@@ -113,18 +113,24 @@ python -m trainer.segmentation_opt --config config/v0_0_1/segmentation.toml
 
 ### 5. Train the final model
 
+1. Write a new config for the final run: a copy of the tuning config with a new `job_name` (e.g. `tiny_final`),
+   so the final model gets its own weights and logs folders.
+2. Put the best trial's settings into its `[training]` section. They are listed in `best_params.json` in the
+   tuning experiment's `model_weights/<model id>/` folder.
+3. Train it:
+
 ```bash
-python -m trainer.segmentation_acc --config config/v0_0_1/segmentation.toml --best_params
+python -m trainer.segmentation_acc --config config/v0_0_1/segmentation_final.toml
 ```
 
-- Trains from scratch with the best settings found in step 4, under the final stopping rule. It prints which
-  trial's settings it used.
-- The model in `model_weights/<model id>/` is replaced by this one. `train_state.json` there records its scores,
-  the trial its settings came from, and why it stopped.
+- Trains from scratch under the final stopping rule. The config is the only source of settings, so the copy saved
+  next to the model shows exactly what trained it.
+- The model is saved to `model_weights/<final model id>/`. `train_state.json` there records its scores and why
+  it stopped.
 
 ### 6. Check and use the model
 
-Open `segmentation_inference.ipynb`. Set the weights folder, the test data and, optionally, your unlabeled data,
+Open `segmentation_inference.ipynb`. Set the weights folder to the final model's, the test data and, optionally, your unlabeled data,
 then run it top to bottom. You get:
 
 1. test scores next to the validation scores from training. If test is much lower, validation was too easy: name
