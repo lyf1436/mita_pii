@@ -62,6 +62,17 @@ python -m data_pipeline.pp4av_to_segmentation --save_dir data/v0_0_1 --raw_dir /
   images and which cities went into each.
 - If the folders already exist the command stops. Add `--overwrite` to rebuild them.
 
+Optional: the internal four-task photo set (COCO boxes). Only its licence plates are kept.
+
+```bash
+python -m data_pipeline.coco_to_segmentation --json data/raw/train_4task.json --save_dir data/v0_0_1 --source geico
+```
+
+- You get `data/v0_0_1/geico_segmentation_train` and `data/v0_0_1/geico_segmentation_test`; a tenth of the photo
+  folders is held out for testing (`--test_fraction`).
+- Images that cannot be read, or whose size does not fit their annotations, are listed and left out.
+- Add the two folders to `dataset_paths` in the config to train on them alongside PP4AV.
+
 Optional: your own images, to try the model on later.
 
 ```bash

@@ -16,6 +16,8 @@ Rationale:
   near-duplicates, so a random split would put almost the same image on both sides and overstate test quality.
 - Masks are kept at the original image resolution, so the labels do not depend on how training later crops or
   scales the images.
+- An image's size is measured with its orientation tag applied, as the trainer decodes it, so image and mask
+  never come out turned against each other.
 - The source archives are downloaded and unpacked once and reused on later runs."""
 import argparse
 import shutil
@@ -77,7 +79,7 @@ def rasterise(label_path, W, H):
 def generate(items):
     for img_path, subset, label_path in items:
         raw = Path(img_path).read_bytes()        # stored as-is: no re-encoding of the image
-        H, W = cv2.imdecode(np.frombuffer(raw, np.uint8), cv2.IMREAD_UNCHANGED).shape[:2]
+        H, W = cv2.imdecode(np.frombuffer(raw, np.uint8), cv2.IMREAD_COLOR).shape[:2]   # as the trainer decodes it
         ok, png = cv2.imencode(".png", rasterise(label_path, W, H))
         assert ok
         yield dict(image_id=f"{subset}/{Path(img_path).stem}", source=SOURCE, subset=subset,
