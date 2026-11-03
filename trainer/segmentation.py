@@ -153,11 +153,14 @@ def crosses(step, total, n):
 
 
 def loss_slope(history, window):
-    """Average change of the validation loss per validation over the last few validations (negative = falling),
-    or None while there are too few."""
+    """Change of the validation loss per validation, as the slope of the least-squares line through the last
+    window + 1 validations (negative = falling), or None while there are too few."""
     if window <= 0 or len(history) <= window:
         return None
-    return (history[-1] - history[-1 - window]) / window
+    y = np.asarray(history[-1 - window:], dtype=np.float64)
+    A = np.stack([np.arange(window + 1, dtype=np.float64), np.ones(window + 1)], axis=1)   # columns: x, 1
+    slope, _ = np.linalg.lstsq(A, y, rcond=None)[0]
+    return float(slope)
 
 
 def build_model(cfg):
