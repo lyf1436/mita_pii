@@ -23,7 +23,6 @@ classes = ["background", "face", "plate"]
 # model: any non-distilled ViT that MiTA-Segmenter has a configuration for
 backbone = "vit_tiny_patch16_384"
 grid = 32                     # patches per side of every model input; MiTA attention only accepts 32 or 40
-px_per_patch = 8              # original-image pixels per model patch; sets the upscale (2x for patch-16)
 dropout = 0.0
 drop_path_rate = 0.1
 
@@ -31,7 +30,9 @@ drop_path_rate = 0.1
 valid_fraction = 0.1          # random share of the training images held out for validation ...
 valid_subsets = []            # ... unless whole subsets are named here (avoids near-duplicate frames in both)
 seed = 0
-scale_jitter = [0.75, 1.25]   # random multiplier on the upscale during training
+scale_range = [0.5, 2.0]      # each training crop: image resized by a random factor in this range (log-uniform),
+                              # then cut or padded to the model input; pick it with detection_eda.ipynb
+eval_scale = 1.0              # validation (and the inference default): whole image resized by this, padded, tiled
 object_crop_prob = 0.5        # share of training crops placed around a random object
 num_workers = 12
 

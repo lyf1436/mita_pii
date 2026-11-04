@@ -33,6 +33,7 @@ Train a model that finds faces and license plates in street images, then use it 
 | `model_weights/<model id>/` | the trained model, a copy of its config, and its final scores |
 | `training_logs/<model id>/` | TensorBoard curves, and the tuning search with one folder per trial |
 | `models/`, `trainer/` | the model and the training commands |
+| `inference/` | the command that blurs images with a trained model |
 
 The model id combines the config's `version`, `dataset_nickname`, `task_nickname`, `model_name` and `job_name`,
 e.g. `v0_0_1_pp4av_seg3_mita_segmentation_tiny_test`.
@@ -73,6 +74,15 @@ python -m data_pipeline.coco_to_segmentation --json data/raw/train_4task.json --
 - Images that cannot be read, or whose size does not fit their annotations, are listed and left out.
 - Add the two folders to `dataset_paths` in the config to train on them alongside PP4AV.
 
+The same photo set as boxes instead of masks, for measuring object sizes in step 2:
+
+```bash
+python -m data_pipeline.coco_to_detection --json data/raw/train_4task.json --save_dir data/v0_0_1 --source geico
+```
+
+You get `data/v0_0_1/geico_detection_train` and `data/v0_0_1/geico_detection_test`, holding the same images on the same
+side of the split as the segmentation version.
+
 Optional: your own images, to try the model on later.
 
 ```bash
@@ -84,12 +94,18 @@ your own name with `--source`). Files that are not readable images are listed an
 
 ### 2. Set up the experiment
 
-Open `config/v0_0_1/segmentation.toml` and decide:
+First choose the training scale range. Open `detection_eda.ipynb` from the repository root, set `DATASET_PATH` to a
+detection dataset (e.g. `data/v0_0_1/geico_detection_train`) and run it. It shows how large faces and plates are, and
+how a candidate range spreads them between one token (too small to find) and one tile (too large to see whole).
+
+Then open `config/v0_0_1/segmentation.toml` and decide:
 
 | setting | what to decide |
 |---|---|
 | `job_name` | a name for this experiment, so it doesn't overwrite another one |
 | `backbone` | model size, e.g. `vit_small_patch16_384` |
+| `scale_range` | the random resize factors of training crops, from `detection_eda.ipynb` |
+| `eval_scale` | the one resize factor for whole images in validation, and the default at inference |
 | `epochs` | the longest a run may last; runs usually stop earlier |
 | `valid_subsets` | cities to validate on. Leave empty to validate on a random tenth of the training images, which scores higher than real use. |
 | `[optuna.params]` | which settings to tune, and over what range |
@@ -150,6 +166,18 @@ then run it top to bottom. You get:
 3. close-ups of single faces and plates, before and after blurring
 4. random images of your own, before and after blurring
 5. any single image file, blurred and optionally saved
+
+`SCALE` in the notebook's settings tries the model at another resize factor than the one it was validated at.
+
+To blur a file or a whole folder of images without the notebook:
+
+```bash
+python -m inference.anonymize --weights model_weights/<model id> --input /path/to/photos --output_dir /path/to/out
+```
+
+Every readable image is written blurred under the same relative path. `--scale` overrides the model's `eval_scale`,
+`--save_masks` also writes the blurred region of each image, and `--threshold`, `--dilate_px` and `--blur_sigma` set
+how much is blurred.
 
 ### Next experiments
 
