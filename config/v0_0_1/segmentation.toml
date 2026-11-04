@@ -1,4 +1,5 @@
 # 3-class segmentation (background / face / plate) of PP4AV with MiTA-Segmenter.
+# The classes are read from the datasets' label names (merged over dataset_paths), not set here.
 # model id = <version>_<dataset_nickname>_<task_nickname>_<model_name>_<job_name>
 #          = v0_0_1_pp4av_seg3_mita_segmentation_tiny_test
 #   weights: model_weights/<model id>     logs: training_logs/<model id>
@@ -14,10 +15,6 @@ dataset_nickname = "pp4av"
 task_nickname = "seg3"
 model_name = "mita_segmentation"                       # the model this task trains
 job_name = "tiny_test"
-
-[classification]
-# model outputs, in the same order as the classes of the prepared segmentation data
-classes = ["background", "face", "plate"]
 
 [training]
 # model: any non-distilled ViT that MiTA-Segmenter has a configuration for

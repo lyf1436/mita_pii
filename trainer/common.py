@@ -32,7 +32,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 WEIGHTS_ROOT = REPO_ROOT / "model_weights"
 LOGS_ROOT = REPO_ROOT / "training_logs"
 ID_KEYS = ("version", "dataset_nickname", "task_nickname", "model_name", "job_name")
-SECTIONS = ("classification", "training", "optuna", "accelerate")
+SECTIONS = ("training", "optuna", "accelerate")
 
 
 def load_config(path):
