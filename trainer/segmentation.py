@@ -6,13 +6,18 @@ faces and plates cover a fraction of a percent of the pixels.
 Expectation:
 - Logging, validation and stopping happen at the same shares of training images whatever the batch size or
   number of devices, so runs that differ in those are compared fairly.
-- Validation scores what inference would produce: whole validation images, labelled at full resolution.
+- Validation scores what inference would produce: whole validation images, resized by the configured inference
+  scale, padded and labelled tile by tile.
 - The model is saved after every validation, so a run that is interrupted or stopped keeps its latest state.
 - A run stops once its validation loss is no longer falling fast enough.
 
 Rationale:
-- Training crops are cut so that, once resized to the input size, objects appear at the scale used at inference,
-  with some random variation for robustness.
+- Each training crop is the image resized by a random factor from a configured range, then cut or padded to the
+  input size. The model learns faces and plates over the whole range of sizes the factors produce, instead of at
+  one scale; the range is chosen from the measured object sizes (detection_eda.ipynb).
+- Factors are drawn evenly on a log scale, so halving and doubling an object's size are equally likely.
+- Parts of a crop that fall outside the image are padded with black and labelled background, as inference pads an
+  image smaller than one tile.
 - Some crops are placed around an object: random crops would almost always contain background only.
 - The loss adds a Dice term per object class to cross-entropy. Cross-entropy counts pixels, so background
   dominates it; Dice scores each class by overlap, whatever its size.
@@ -58,10 +63,35 @@ def undecoded(ds):
     return ds.cast_column("image", HFImage(decode=False)).cast_column("mask", HFImage(decode=False))
 
 
+def window_start(extent, win, lo=None, hi=None):
+    """A random start for a window of side `win` along an image side of length `extent`: the window within the image,
+    or the image within the window where the window is longer. With an object at [lo, hi), the window also keeps
+    the object inside it, or lies within the object where the object is longer."""
+    a, b = min(0.0, extent - win), max(0.0, extent - win)
+    if lo is not None:
+        a, b = max(a, hi - win), min(b, lo)
+    return random.uniform(min(a, b), max(a, b))
+
+
+def scaled_window(arr, x0, y0, win, size, interpolation):
+    """The square of side `win` starting at (x0, y0) in image pixels, resized to size x size, and the part of it the
+    image covers as slices. Parts outside the image are zero."""
+    H, W = arr.shape[:2]
+    s, x0, y0 = size / win, int(round(x0)), int(round(y0))            # whole-pixel start: offsets below never go negative
+    ix1, iy1, ix2, iy2 = max(0, x0), max(0, y0), min(W, int(np.ceil(x0 + win))), min(H, int(np.ceil(y0 + win)))
+    ox1, oy1 = int(round((ix1 - x0) * s)), int(round((iy1 - y0) * s))
+    ox2, oy2 = min(size, int(round((ix2 - x0) * s))), min(size, int(round((iy2 - y0) * s)))
+    out, inside = np.zeros((size, size) + arr.shape[2:], arr.dtype), (slice(oy1, oy2), slice(ox1, ox2))
+    if ix2 > ix1 and iy2 > iy1 and ox2 > ox1 and oy2 > oy1:
+        out[inside] = cv2.resize(arr[iy1:iy2, ix1:ix2], (ox2 - ox1, oy2 - oy1), interpolation=interpolation)
+    return out, inside
+
+
 class CropDataset(torch.utils.data.Dataset):
-    def __init__(self, ds, input_size, upscale, tcfg):
-        self.ds, self.input_size, self.upscale = undecoded(ds), input_size, upscale
-        self.scale_jitter, self.object_crop_prob = tuple(tcfg["scale_jitter"]), tcfg["object_crop_prob"]
+    def __init__(self, ds, input_size, tcfg):
+        self.ds, self.input_size = undecoded(ds), input_size
+        self.log_scale_range = tuple(np.log(tcfg["scale_range"]))
+        self.object_crop_prob = tcfg["object_crop_prob"]
 
     def __len__(self):
         return len(self.ds)
@@ -70,25 +100,23 @@ class CropDataset(torch.utils.data.Dataset):
         img, mask = decode_row(self.ds[i])
         H, W = img.shape[:2]
         size = self.input_size
-        scale = self.upscale * random.uniform(*self.scale_jitter)
-        win = min(int(round(size / scale)), H, W)                 # window side in original pixels
+        scale = float(np.exp(random.uniform(*self.log_scale_range)))
+        win = size / scale                                          # window side in image pixels
 
         if random.random() < self.object_crop_prob and mask.any():
             n, _, stats, _ = cv2.connectedComponentsWithStats((mask > 0).astype(np.uint8), connectivity=8)
             x1, y1, bw, bh = stats[random.randrange(1, n), :4]     # component 0 is the background
-            x2, y2 = x1 + bw, y1 + bh
-            x0 = random.uniform(max(0, x2 - win), max(0, min(x1, W - win)))
-            y0 = random.uniform(max(0, y2 - win), max(0, min(y1, H - win)))
+            x0, y0 = window_start(W, win, x1, x1 + bw), window_start(H, win, y1, y1 + bh)
         else:
-            x0, y0 = random.uniform(0, W - win), random.uniform(0, H - win)
-        x0, y0 = int(min(x0, W - win)), int(min(y0, H - win))
+            x0, y0 = window_start(W, win), window_start(H, win)
 
-        crop = cv2.resize(img[y0:y0 + win, x0:x0 + win], (size, size), interpolation=cv2.INTER_LINEAR)
-        crop_mask = cv2.resize(mask[y0:y0 + win, x0:x0 + win], (size, size), interpolation=cv2.INTER_NEAREST)
+        shrink = cv2.INTER_AREA if scale < 1 else cv2.INTER_LINEAR
+        crop, inside = scaled_window(img, x0, y0, win, size, shrink)
+        crop_mask, _ = scaled_window(mask, x0, y0, win, size, cv2.INTER_NEAREST)
+        alpha, beta = random.uniform(0.8, 1.2), random.uniform(-20, 20)       # on the image only: padding stays black
+        crop[inside] = np.clip(crop[inside].astype(np.float32) * alpha + beta, 0, 255).astype(np.uint8)
         if random.random() < 0.5:
             crop, crop_mask = crop[:, ::-1], crop_mask[:, ::-1]
-        alpha, beta = random.uniform(0.8, 1.2), random.uniform(-20, 20)
-        crop = np.clip(crop.astype(np.float32) * alpha + beta, 0, 255).astype(np.uint8)
         return (torch.from_numpy(np.ascontiguousarray(crop)).permute(2, 0, 1),
                 torch.from_numpy(np.ascontiguousarray(crop_mask)).long())
 
@@ -102,10 +130,10 @@ def dice_loss(logits, target, cls):
 
 
 @torch.no_grad()
-def evaluate(model, ds, batch_size=16, accelerator=None):
-    """Label every image in the dataset at full resolution and score the result: validation loss, and Dice and IoU
-    per class, counted over all pixels of all images. Across several devices each takes a share of the images and
-    the counts are combined.
+def evaluate(model, ds, scale=1.0, batch_size=16, accelerator=None):
+    """Label every image in the dataset, resized by `scale` as inference does, and score the result at the image's
+    own resolution: validation loss, and Dice and IoU per class, counted over all pixels of all images. Across several
+    devices each takes a share of the images and the counts are combined.
 
     The loss weighs the Dice term by 1 whatever weight training uses, so it keeps one scale across runs."""
     n_cls = len(model.classes)
@@ -119,7 +147,7 @@ def evaluate(model, ds, batch_size=16, accelerator=None):
     model.eval()
     for row in undecoded(ds):
         img, mask = decode_row(row)
-        prob = model.predict(img, batch_size=batch_size)
+        prob = model.predict(img, scale=scale, batch_size=batch_size)
         pred = prob.argmax(0)
         target = torch.from_numpy(mask).to(device).long()
         onehot = F.one_hot(target, n_cls).permute(2, 0, 1).float()
@@ -169,8 +197,8 @@ def build_model(cfg):
         raise ValueError(f"[classification] classes {classes} must match the segmentation format's label ids "
                          f"{SEGMENTATION_CLASSES} (data_pipeline/formats.py)")
     t = cfg["training"]
-    return MitaSegmentation(backbone=t["backbone"], classes=classes, grid=t["grid"], px_per_patch=t["px_per_patch"],
-                            dropout=t["dropout"], drop_path_rate=t["drop_path_rate"])
+    return MitaSegmentation(backbone=t["backbone"], classes=classes, grid=t["grid"], dropout=t["dropout"],
+                            drop_path_rate=t["drop_path_rate"])
 
 
 def save_model(model, out_dir, cfg, state):
@@ -204,7 +232,7 @@ def train(cfg, log_name=None, weights_dir=None, report=None):
 
     model = build_model(cfg)
     loader = torch.utils.data.DataLoader(
-        CropDataset(train_ds, model.input_size, model.upscale, t), batch_size=t["batch_size"], shuffle=True,
+        CropDataset(train_ds, model.input_size, t), batch_size=t["batch_size"], shuffle=True,
         drop_last=True, num_workers=t["num_workers"], pin_memory=True, persistent_workers=t["num_workers"] > 0,
     )
     loader = accelerator.prepare(loader)                       # sharded across devices
@@ -270,7 +298,7 @@ def train(cfg, log_name=None, weights_dir=None, report=None):
 
             if not crosses(state["step"], total_steps, t["num_evals"]):
                 continue
-            metrics = evaluate(raw_model, valid_ds, t["eval_batch_size"], accelerator)
+            metrics = evaluate(raw_model, valid_ds, t["eval_scale"], t["eval_batch_size"], accelerator)
             state["evals"] += 1
             history.append(metrics["loss"])
             slope = loss_slope(history, t["early_stopping_window"])

@@ -5,14 +5,16 @@ its decoder was written for 150 classes.
 
 Expectation:
 - It takes ordinary 8-bit RGB images; normalisation happens inside.
-- It labels a full image of any size and returns each class's probability at that image's own resolution.
+- It labels a full image of any size, resized by a factor the caller chooses, and returns each class's
+  probability at the image's own resolution.
 - A saved model folder reloads into the same model, without downloading anything.
 
 Rationale:
-- Images are enlarged so that one patch covers a fixed number of original pixels: at native resolution most faces
-  and plates are smaller than a single patch.
+- The model knows nothing about the data's scale: the grid and the patch size only fix the input size. How large
+  objects appear is set by the caller, through the resize factor at inference and the scaling of training crops.
 - A full image is labelled in tiles of the fixed input size, because the attention fixes that size; shrinking the
-  whole image to fit would erase small objects.
+  whole image to fit would erase small objects. An image smaller than one tile is padded, as training pads its
+  crops.
 - At least three classes are required: the decoder normalises each pixel's class scores, and with only two
   classes the scores collapse to +1/-1, leaving nothing to learn from.
 - The decoder's 150-class limit is lifted by a replacement that is checked to give identical results at 150.
@@ -99,7 +101,7 @@ def usable_backbones():
 
 
 class MitaSegmentation(nn.Module):
-    def __init__(self, backbone, classes, grid=32, px_per_patch=8, dropout=0.0, drop_path_rate=0.1,
+    def __init__(self, backbone, classes, grid=32, dropout=0.0, drop_path_rate=0.1,
                  pretrained=True):
         super().__init__()
         assert grid in (32, 40), "MiTA-Segmenter attention only accepts 32x32 or 40x40 patch grids"
@@ -114,13 +116,12 @@ class MitaSegmentation(nn.Module):
             if not weights.exists():
                 raise FileNotFoundError(f"vit_base_patch8_384 needs its ImageNet weights at {weights}")
 
-        self.config = dict(backbone=backbone, classes=list(classes), grid=grid, px_per_patch=px_per_patch,
-                           dropout=dropout, drop_path_rate=drop_path_rate)
+        self.config = dict(backbone=backbone, classes=list(classes), grid=grid, dropout=dropout,
+                           drop_path_rate=drop_path_rate)
         enc = segm_cfg["model"][backbone]
         self.classes = list(classes)
         self.patch_size = enc["patch_size"]
         self.input_size = grid * enc["patch_size"]              # model input side in pixels
-        self.upscale = enc["patch_size"] / px_per_patch          # original image -> model resolution
 
         decoder = dict(segm_cfg["decoder"]["mask_transformer"], name="mask_transformer")
         _patch_decoder(enc["d_model"], decoder["n_heads"], grid)
@@ -145,15 +146,17 @@ class MitaSegmentation(nn.Module):
         return self.net((images.float() - self.mean) / self.std)
 
     @torch.no_grad()
-    def predict(self, img_rgb, batch_size=16, amp_dtype=torch.bfloat16):
+    def predict(self, img_rgb, scale=1.0, batch_size=16, amp_dtype=torch.bfloat16):
         """A full RGB image of any size -> each class's probability for every pixel, at the image's own resolution.
 
-        The enlarged image is labelled tile by tile. Tiles do not overlap, except where the last tile of a row or column
-        is moved back to end at the image border; there the two results are averaged."""
+        The image is resized by `scale`, padded to at least one tile, and labelled tile by tile. Tiles do not overlap,
+        except where the last tile of a row or column is moved back to end at the image border; there the two results
+        are averaged."""
         device = self.mean.device
         H, W = img_rgb.shape[:2]
         x = torch.from_numpy(np.ascontiguousarray(img_rgb)).permute(2, 0, 1)[None].to(device).float()
-        x = F.interpolate(x, scale_factor=self.upscale, mode="bilinear", align_corners=False)
+        if scale != 1:
+            x = F.interpolate(x, scale_factor=scale, mode="bilinear", align_corners=False, antialias=scale < 1)
         sh, sw = x.shape[2:]
         pad_h, pad_w = max(0, self.input_size - sh), max(0, self.input_size - sw)
         if pad_h or pad_w:                                       # sliding_window needs at least one full window
@@ -181,6 +184,7 @@ class MitaSegmentation(nn.Module):
         weights_dir = Path(weights_dir)
         cfg = json.loads((weights_dir / "config.json").read_text())
         assert cfg.pop("model") == "mita_segmentation", f"{weights_dir} does not hold a mita_segmentation model"
+        cfg.pop("px_per_patch", None)      # older models: trained at a fixed scale, now passed to predict instead
         model = cls(**cfg, pretrained=False)
         model.net.load_state_dict(load_file(weights_dir / "model.safetensors", device="cpu"), strict=True)
         return model.to(device).eval()

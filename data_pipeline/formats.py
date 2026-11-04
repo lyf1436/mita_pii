@@ -8,7 +8,7 @@ in both.
 Rationale: the columns and the class list of a format are fixed in one place, so separately prepared sources
 cannot drift apart. A class list only grows by appending, so the classes already in it keep their values and
 datasets prepared earlier stay mergeable with newer ones."""
-from datasets import Features, Image, Value
+from datasets import Features, Image, Sequence, Value
 
 # segmentation: `mask` is a single-channel PNG whose pixel values are indices into this list
 SEGMENTATION_CLASSES = ["background", "face", "plate"]
@@ -19,6 +19,22 @@ SEGMENTATION_FEATURES = Features({
     "subset": Value("string"),     # source-specific grouping (PP4AV: city); used for group-wise splits
     "image": Image(),
     "mask": Image(),
+})
+
+# detection: the same classes as segmentation, one box per object
+DETECTION_CLASSES = SEGMENTATION_CLASSES
+
+DETECTION_FEATURES = Features({
+    "image_id": Value("string"),   # unique within a source
+    "source": Value("string"),
+    "subset": Value("string"),     # source-specific grouping; used for group-wise splits
+    "image": Image(),
+    "width": Value("int32"),       # of the image as decoded, orientation tag applied
+    "height": Value("int32"),
+    "objects": Sequence({
+        "bbox": Sequence(Value("float32"), length=4),   # x, y, width, height in pixels of the decoded image
+        "category": Value("int32"),                     # index into DETECTION_CLASSES
+    }),
 })
 
 # unlabeled: images only, e.g. for inference demos; same columns as segmentation minus the mask
