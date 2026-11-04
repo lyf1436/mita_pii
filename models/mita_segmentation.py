@@ -145,21 +145,32 @@ class MitaSegmentation(nn.Module):
 
     @torch.no_grad()
     def predict(self, img_rgb, amp_dtype=torch.bfloat16):
-        """A full RGB image of any size -> each class's probability for every pixel, at the image's own resolution.
+        """A full RGB image of any size -> each class's probability for every pixel, at the image's own resolution."""
+        return next(self.predict_batch([img_rgb], amp_dtype))
 
-        The image is resized so its longer side is the input size, padded with black at the bottom and right to a
-        square input, and labelled in one pass. The probabilities of the image area are resized back to the image."""
+    @torch.no_grad()
+    def predict_batch(self, imgs_rgb, amp_dtype=torch.bfloat16):
+        """Full RGB images of any sizes, labelled in one forward pass -> each image's class probabilities at its own
+        resolution, one image at a time.
+
+        Each image is resized so its longer side is the input size and padded with black at the bottom and right to
+        a square input. The probabilities of each image area are resized back to the image only as that image is
+        taken, so only one full-resolution map is held at once."""
         device, size = self.mean.device, self.input_size
-        H, W = img_rgb.shape[:2]
-        scale = size / max(H, W)
-        h, w = min(size, round(H * scale)), min(size, round(W * scale))
-        x = torch.from_numpy(np.ascontiguousarray(img_rgb)).permute(2, 0, 1)[None].to(device).float()
-        x = F.interpolate(x, size=(h, w), mode="bilinear", align_corners=False, antialias=scale < 1)
-        x = F.pad(x, (0, size - w, 0, size - h))
+        inputs, areas = [], []
+        for img in imgs_rgb:
+            H, W = img.shape[:2]
+            scale = size / max(H, W)
+            h, w = min(size, round(H * scale)), min(size, round(W * scale))
+            x = torch.from_numpy(np.ascontiguousarray(img)).permute(2, 0, 1)[None].to(device).float()
+            x = F.interpolate(x, size=(h, w), mode="bilinear", align_corners=False, antialias=scale < 1)
+            inputs.append(F.pad(x, (0, size - w, 0, size - h)))
+            areas.append((H, W, h, w))
         with torch.autocast(device.type, dtype=amp_dtype, enabled=amp_dtype is not None):
-            logits = self(x).float()
-        prob = logits[0, :, :h, :w].softmax(0)                    # drop the padding
-        return F.interpolate(prob[None], (H, W), mode="bilinear", align_corners=False)[0]
+            logits = self(torch.cat(inputs)).float()
+        for logit, (H, W, h, w) in zip(logits, areas):
+            prob = logit[:, :h, :w].softmax(0)                    # drop the padding
+            yield F.interpolate(prob[None], (H, W), mode="bilinear", align_corners=False)[0]
 
     def save(self, out_dir):
         out_dir = Path(out_dir)

@@ -3,7 +3,7 @@
 Usage:
     python -m inference.anonymize --weights model_weights/<model id> --input photo.jpg --output_dir out
     python -m inference.anonymize --weights model_weights/<model id> --input /path/to/photos --output_dir out \
-        --threshold 0.3 --save_masks
+        --threshold 0.3 --batch_size 32 --save_masks
 
 Assumption: the weights folder was written by the segmentation trainer.
 
@@ -13,7 +13,8 @@ listed and left out.
 
 Rationale:
 - The whole image is resized so its longer side is the model input size, padded to a square and labelled in one
-  pass, as validation does, so a script result matches the scores in training.
+  pass, as validation does, so a script result matches the scores in training. Several images share each forward
+  pass, which only changes speed and memory, not the result.
 - Everything the model gives a probability of face or plate above the threshold is blurred, and the region is
   grown by a few pixels first, so the edges of a face or plate are blurred too.
 - Images are read upright (orientation tag applied), as the model was trained on them, and written upright."""
@@ -28,10 +29,16 @@ from data_pipeline.folder_to_unlabeled import IMG_EXTS, find_images
 from models.mita_segmentation import MitaSegmentation
 
 
-@torch.no_grad()
+def private_probs(model, imgs_rgb):
+    """RGB uint8 images [H, W, 3], labelled in one forward pass -> for each, the probability that a pixel is not
+    background, float32 [H, W], one image at a time."""
+    for prob in model.predict_batch(imgs_rgb):
+        yield (1 - prob[0]).cpu().numpy()
+
+
 def private_prob(model, img_rgb):
     """RGB uint8 [H, W, 3] -> probability that a pixel is not background, float32 [H, W]."""
-    return (1 - model.predict(img_rgb)[0]).cpu().numpy()
+    return next(private_probs(model, [img_rgb]))
 
 
 def anonymize(img_rgb, prob, threshold=0.5, dilate_px=3, blur_sigma=8):
@@ -52,6 +59,7 @@ def main():
     ap.add_argument("--threshold", type=float, default=0.5, help="probability above which a pixel is blurred")
     ap.add_argument("--dilate_px", type=int, default=3, help="grow the blurred region by this many pixels")
     ap.add_argument("--blur_sigma", type=float, default=8)
+    ap.add_argument("--batch_size", type=int, default=16, help="images per forward pass")
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     ap.add_argument("--save_masks", action="store_true", help="also write each blurred region as <name>_mask.png")
     args = ap.parse_args()
@@ -66,19 +74,24 @@ def main():
     print(f"{len(paths)} image(s), threshold {args.threshold:g}, device {args.device}")
 
     skipped = []
-    for path in paths:
-        img = cv2.imread(str(path), cv2.IMREAD_COLOR)                # orientation tag applied
-        if img is None:
-            skipped.append(path)
+    for start in range(0, len(paths), args.batch_size):
+        batch = []
+        for path in paths[start:start + args.batch_size]:
+            img = cv2.imread(str(path), cv2.IMREAD_COLOR)            # orientation tag applied
+            if img is None:
+                skipped.append(path)
+            else:
+                batch.append((path, cv2.cvtColor(img, cv2.COLOR_BGR2RGB)))
+        if not batch:
             continue
-        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-        anon, mask = anonymize(img, private_prob(model, img), args.threshold, args.dilate_px, args.blur_sigma)
-        out = args.output_dir / path.relative_to(root)
-        out.parent.mkdir(parents=True, exist_ok=True)
-        cv2.imwrite(str(out), cv2.cvtColor(anon, cv2.COLOR_RGB2BGR))
-        if args.save_masks:
-            cv2.imwrite(str(out.with_name(f"{out.stem}_mask.png")), mask * 255)
-        print(f"{out}: {100 * mask.mean():.2f}% of pixels blurred")
+        for (path, img), prob in zip(batch, private_probs(model, [img for _, img in batch])):
+            anon, mask = anonymize(img, prob, args.threshold, args.dilate_px, args.blur_sigma)
+            out = args.output_dir / path.relative_to(root)
+            out.parent.mkdir(parents=True, exist_ok=True)
+            cv2.imwrite(str(out), cv2.cvtColor(anon, cv2.COLOR_RGB2BGR))
+            if args.save_masks:
+                cv2.imwrite(str(out.with_name(f"{out.stem}_mask.png")), mask * 255)
+            print(f"{out}: {100 * mask.mean():.2f}% of pixels blurred")
 
     print(f"wrote {len(paths) - len(skipped)} image(s) to {args.output_dir}")
     if skipped:
