@@ -20,10 +20,18 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-from data_pipeline.formats import UNLABELED_FEATURES
+from datasets import Features, Image, Value
+
 from data_pipeline.hf_save import save_generated
 
 IMG_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".webp", ".tif", ".tiff"}
+
+FEATURES = Features({
+    "image_id": Value("string"),   # path relative to the input folder
+    "source": Value("string"),
+    "subset": Value("string"),     # the image's folder, relative to the input folder ("" at the top level)
+    "image": Image(),
+})
 
 
 def find_images(input_dir):
@@ -61,7 +69,7 @@ def main():
         if not args.overwrite:
             raise FileExistsError(f"{out} exists (pass --overwrite to replace it)")
         shutil.rmtree(out)
-    ds = save_generated(generate, UNLABELED_FEATURES, {"paths": paths, "input_dir": input_dir, "source": source},
+    ds = save_generated(generate, FEATURES, {"paths": paths, "input_dir": input_dir, "source": source},
                         out, num_proc=min(args.num_proc, len(paths)))
 
     skipped = sorted(set(paths) - {str(input_dir / i) for i in ds["image_id"]})

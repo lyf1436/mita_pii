@@ -20,6 +20,7 @@ Train a model that finds faces and license plates in street images, then use it 
 | Every source gives a train part and a test part | Test images are held out from the start, so the test score always comes from images training never saw. |
 | PP4AV's test part is whole cities | Images from one city are frames of one video and many are near-duplicates. A random split would test on images almost identical to training ones. |
 | Prepared data of the same kind can be merged | A config lists the datasets to train on, so combining sources means editing a list. |
+| Each data command is self-contained, and its data names its own labels | No shared code fixes the classes or their order. Every segmentation command saves the same columns, including `label_names` (the class name of each mask value), so the datasets concatenate; the trainer takes the union of the names as the model's classes, and the same name in two sources is one class. |
 | Tuning and final training are separate steps | Tuning tries many settings with short runs that stop early. The final model is trained from scratch with the best settings and a stricter stopping rule. |
 | Progress is counted in training images, not steps | Logging, validation and stopping fall at the same points of a run whatever the batch size or number of GPUs, so such runs are compared fairly. |
 
@@ -27,7 +28,7 @@ Train a model that finds faces and license plates in street images, then use it 
 
 | folder | what you find there |
 |---|---|
-| `data_pipeline/` | commands that prepare a data source |
+| `data_pipeline/` | commands that prepare a data source, each on its own |
 | `data/<version>/` | prepared datasets: `<source>_<format>_train` and `<source>_<format>_test` |
 | `config/<version>/` | one experiment config per task |
 | `model_weights/<model id>/` | the trained model, a copy of its config, and its final scores |
@@ -63,25 +64,34 @@ python -m data_pipeline.pp4av_to_segmentation --save_dir data/v0_0_1 --raw_dir /
   images and which cities went into each.
 - If the folders already exist the command stops. Add `--overwrite` to rebuild them.
 
-Optional: the internal four-task photo set (COCO boxes). Only its licence plates are kept.
+Optional: the internal four-task photo set (COCO boxes). A box's label is its category's supercategory;
+`--label_rename` renames them (several to one name merges them, `null` drops them). To keep only the licence plates,
+as the class `plate` that PP4AV also has, rename `license_plate` and drop every other supercategory (the command
+prints the labels it ends up with, and names the file's supercategories if a key is not one of them):
 
 ```bash
-python -m data_pipeline.coco_to_segmentation --json data/raw/train_4task.json --save_dir data/v0_0_1 --source geico
+python -m data_pipeline.coco_to_segmentation --json data/raw/train_4task.json --save_dir data/v0_0_1 --source geico \
+    --label_rename '{"license_plate": "plate", "<other supercategory>": null}' --num_proc 16
 ```
 
 - You get `data/v0_0_1/geico_segmentation_train` and `data/v0_0_1/geico_segmentation_test`; a tenth of the photo
   folders is held out for testing (`--test_fraction`).
 - Images that cannot be read, or whose size does not fit their annotations, are listed and left out.
-- Add the two folders to `dataset_paths` in the config to train on them alongside PP4AV.
+- Categories named `NOT_...` are left out (`--negative_prefix`). Images with no kept box get an all-background mask.
+- `--num_proc` worker processes read the images in parallel.
+- Add the two folders to `dataset_paths` in the config to train on them alongside PP4AV. The model's classes are the
+  union of the label names of all listed datasets: background first, then the others alphabetically.
 
 The same photo set as boxes instead of masks, for measuring object sizes in step 2:
 
 ```bash
-python -m data_pipeline.coco_to_detection --json data/raw/train_4task.json --save_dir data/v0_0_1 --source geico
+python -m data_pipeline.coco_to_detection --json data/raw/train_4task.json --save_dir data/v0_0_1 --source geico \
+    --label_rename '{"license_plate": "plate", "<other supercategory>": null}'
 ```
 
-You get `data/v0_0_1/geico_detection_train` and `data/v0_0_1/geico_detection_test`, holding the same images on the same
-side of the split as the segmentation version.
+You get `data/v0_0_1/geico_detection_train` and `data/v0_0_1/geico_detection_test`, each box with its label's name.
+With the same file and `--test_fraction`, they hold the same images on the same side of the split as the segmentation
+version.
 
 Optional: your own images, to try the model on later.
 

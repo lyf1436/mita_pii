@@ -6,8 +6,13 @@ Usage:
 
 Assumption: a labelled box is a close enough outline of a face or plate for blurring.
 
-Expectation: a train part and a test part in the data version folder. Every image comes with a mask that marks
-each pixel as background, face or plate. The test part consists of whole cities the train part never contains.
+Expectation: a train part and a test part in the data version folder, `pp4av_segmentation_train` and
+`pp4av_segmentation_test`. Every image comes with a mask that marks each pixel as background, face or plate, and
+with the names of its mask values. The test part consists of whole cities the train part never contains.
+
+Columns: image_id, source, subset (the city), image (stored bytes), mask (single-channel PNG, pixel value v = class
+label_names[v]), label_names. Other segmentation pipelines save the same columns, so their datasets concatenate
+with these; the trainer reads the class names from label_names, so no pipeline needs to know another's classes.
 
 Rationale:
 - Boxes are filled in as masks because everything inside a box is to be blurred. Box edges are rounded outwards,
@@ -18,6 +23,8 @@ Rationale:
   scales the images.
 - An image's size is measured with its orientation tag applied, as the trainer decodes it, so image and mask
   never come out turned against each other.
+- The class names travel with every row instead of being fixed in shared code, so this script alone decides which
+  classes it produces and in which order.
 - The source archives are downloaded and unpacked once and reused on later runs."""
 import argparse
 import shutil
@@ -27,14 +34,24 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-from data_pipeline.formats import SEGMENTATION_CLASSES, SEGMENTATION_FEATURES, split_names
+from datasets import Features, Image, Sequence, Value
+
 from data_pipeline.hf_save import save_generated
 
 HF_REPO = "khaclinh/pp4av"
 SOURCE = "pp4av"
 IMG_EXTS = {".png", ".jpg", ".jpeg"}
-# PP4AV label file class -> index in SEGMENTATION_CLASSES
-LABEL_TO_CLASS = {0: SEGMENTATION_CLASSES.index("face"), 1: SEGMENTATION_CLASSES.index("plate")}
+LABEL_NAMES = ["background", "face", "plate"]     # mask pixel value -> class name
+LABEL_TO_CLASS = {0: LABEL_NAMES.index("face"), 1: LABEL_NAMES.index("plate")}   # PP4AV label file class -> mask value
+
+FEATURES = Features({
+    "image_id": Value("string"),            # <city>/<file stem>
+    "source": Value("string"),
+    "subset": Value("string"),              # city; used for group-wise splits
+    "image": Image(),
+    "mask": Image(),                        # single-channel PNG of indices into label_names
+    "label_names": Sequence(Value("string")),
+})
 
 
 def fetch_and_extract(raw_dir, zip_name, out_name):
@@ -84,7 +101,7 @@ def generate(items):
         assert ok
         yield dict(image_id=f"{subset}/{Path(img_path).stem}", source=SOURCE, subset=subset,
                    image={"bytes": raw, "path": Path(img_path).name},
-                   mask={"bytes": png.tobytes(), "path": None})
+                   mask={"bytes": png.tobytes(), "path": None}, label_names=LABEL_NAMES)
 
 
 def main():
@@ -106,7 +123,7 @@ def main():
         raise ValueError(f"unknown test subsets {sorted(unknown)}; PP4AV has {subsets}")
 
     args.save_dir.mkdir(parents=True, exist_ok=True)
-    splits = dict(zip(split_names(SOURCE, "segmentation"), (
+    splits = dict(zip((f"{SOURCE}_segmentation_train", f"{SOURCE}_segmentation_test"), (
         [it for it in items if it[1] not in args.test_subsets],
         [it for it in items if it[1] in args.test_subsets],
     )))
@@ -116,7 +133,7 @@ def main():
             if not args.overwrite:
                 raise FileExistsError(f"{out} exists (pass --overwrite to replace it)")
             shutil.rmtree(out)
-        ds = save_generated(generate, SEGMENTATION_FEATURES, {"items": split_items}, out,
+        ds = save_generated(generate, FEATURES, {"items": split_items}, out,
                             num_proc=min(args.num_proc, len(split_items)))
         print(f"{out}: {len(ds)} images from {sorted({s for _, s, _ in split_items})}")
 

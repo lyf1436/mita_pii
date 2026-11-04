@@ -1,7 +1,8 @@
 """Training and validation of a per-pixel segmentation model.
 
-Assumption: the data is in the segmentation format, and the classes other than background are rare and small:
-faces and plates cover a fraction of a percent of the pixels.
+Assumption: every row holds an image, a single-channel mask, and `label_names`, the class name of each mask value,
+with value 0 the background (whatever it is named). The classes other than background are rare and small: faces
+and plates cover a fraction of a percent of the pixels.
 
 Expectation:
 - Logging, validation and stopping happen at the same shares of training images whatever the batch size or
@@ -12,6 +13,9 @@ Expectation:
 - A run stops once its validation loss is no longer falling fast enough.
 
 Rationale:
+- The model's classes are the union of the label names of the training data: the background first, then the other
+  names in alphabetical order. Datasets prepared separately can thus list their classes in any order, and the same
+  name in two datasets is one class. Each mask is translated to the model's class indices as it is read.
 - Each training crop is the image resized by a random factor from a configured range, then cut or padded to the
   model input size. The model learns faces and plates over the whole range of sizes the factors produce, instead of at
   one scale; the range is chosen from the measured object sizes (detection_eda.ipynb).
@@ -42,7 +46,6 @@ from accelerate import Accelerator, DistributedDataParallelKwargs
 from datasets import Image as HFImage
 from torch.utils.tensorboard import SummaryWriter
 
-from data_pipeline.formats import SEGMENTATION_CLASSES
 from models.mita_segmentation import MitaSegmentation
 from segm.optim.factory import create_optimizer, create_scheduler
 from trainer.common import (LOGS_ROOT, WEIGHTS_ROOT, load_merged_dataset, model_id, train_valid_split)
@@ -51,10 +54,41 @@ MODEL_NAME = "mita_segmentation"
 cv2.setNumThreads(0)                     # let DataLoader workers parallelise, not OpenCV threads
 
 
-def decode_row(row):
-    """A stored row -> the RGB image and its class mask."""
+def dataset_classes(ds):
+    """The classes of a (merged) segmentation dataset: the background, i.e. the name of mask value 0, then every
+    other label name in alphabetical order."""
+    tables = set(map(tuple, ds.data.column("label_names").to_pylist()))
+    backgrounds = {t[0] for t in tables}
+    if len(backgrounds) != 1:
+        raise ValueError(f"the datasets name mask value 0 (the background) differently: {sorted(backgrounds)}")
+    background = backgrounds.pop()
+    return [background] + sorted({n for t in tables for n in t} - {background})
+
+
+_LUTS = {}
+
+
+def class_lut(label_names, classes):
+    """Mask value of a row with these label names -> index in `classes`."""
+    key = (tuple(label_names), tuple(classes))
+    if key not in _LUTS:
+        index = {name: i for i, name in enumerate(classes)}
+        missing = [n for n in label_names if n not in index]
+        if missing:
+            raise ValueError(f"labels {missing} are not among the model's classes {list(classes)}")
+        lut = np.zeros(256, np.uint8)
+        lut[:len(label_names)] = [index[n] for n in label_names]
+        _LUTS[key] = lut
+    return _LUTS[key]
+
+
+def decode_row(row, classes=None):
+    """A stored row -> the RGB image and its class mask. With `classes`, mask values are translated from the row's
+    label_names to indices into `classes`; without, they are left as stored."""
     img = cv2.imdecode(np.frombuffer(row["image"]["bytes"], np.uint8), cv2.IMREAD_COLOR)
     mask = cv2.imdecode(np.frombuffer(row["mask"]["bytes"], np.uint8), cv2.IMREAD_UNCHANGED)
+    if classes is not None:
+        mask = class_lut(row["label_names"], classes)[mask]
     return cv2.cvtColor(img, cv2.COLOR_BGR2RGB), mask
 
 
@@ -88,8 +122,8 @@ def scaled_window(arr, x0, y0, win, size, interpolation):
 
 
 class CropDataset(torch.utils.data.Dataset):
-    def __init__(self, ds, input_size, tcfg):
-        self.ds, self.input_size = undecoded(ds), input_size
+    def __init__(self, ds, input_size, tcfg, classes):
+        self.ds, self.input_size, self.classes = undecoded(ds), input_size, list(classes)
         self.log_scale_range = tuple(np.log(tcfg["scale_range"]))
         self.object_crop_prob = tcfg["object_crop_prob"]
 
@@ -97,7 +131,7 @@ class CropDataset(torch.utils.data.Dataset):
         return len(self.ds)
 
     def __getitem__(self, i):
-        img, mask = decode_row(self.ds[i])
+        img, mask = decode_row(self.ds[i], self.classes)
         H, W = img.shape[:2]
         size = self.input_size
         scale = float(np.exp(random.uniform(*self.log_scale_range)))
@@ -147,7 +181,7 @@ def evaluate(model, ds, batch_size=16, accelerator=None):
     model.eval()
     rows = undecoded(ds)
     for start in range(0, len(rows), batch_size):
-        batch = [decode_row(rows[i]) for i in range(start, min(start + batch_size, len(rows)))]
+        batch = [decode_row(rows[i], model.classes) for i in range(start, min(start + batch_size, len(rows)))]
         for (_, mask), prob in zip(batch, model.predict_batch([img for img, _ in batch])):
             _add_counts(sums, prob, mask, n_cls)
     model.train(was_training)
@@ -197,11 +231,7 @@ def loss_slope(history, window):
     return float(slope)
 
 
-def build_model(cfg):
-    classes = cfg["classification"]["classes"]
-    if classes != SEGMENTATION_CLASSES[:len(classes)]:
-        raise ValueError(f"[classification] classes {classes} must match the segmentation format's label ids "
-                         f"{SEGMENTATION_CLASSES} (data_pipeline/formats.py)")
+def build_model(cfg, classes):
     t = cfg["training"]
     return MitaSegmentation(backbone=t["backbone"], classes=classes, grid=t["grid"], dropout=t["dropout"],
                             drop_path_rate=t["drop_path_rate"])
@@ -236,9 +266,10 @@ def train(cfg, log_name=None, weights_dir=None, report=None):
     ds = load_merged_dataset(cfg["dataset_paths"])
     train_ds, valid_ds = train_valid_split(ds, t["valid_fraction"], t.get("valid_subsets", []), t["seed"])
 
-    model = build_model(cfg)
+    classes = dataset_classes(ds)
+    model = build_model(cfg, classes)
     loader = torch.utils.data.DataLoader(
-        CropDataset(train_ds, model.input_size, t), batch_size=t["batch_size"], shuffle=True,
+        CropDataset(train_ds, model.input_size, t, classes), batch_size=t["batch_size"], shuffle=True,
         drop_last=True, num_workers=t["num_workers"], pin_memory=True, persistent_workers=t["num_workers"] > 0,
     )
     loader = accelerator.prepare(loader)                       # sharded across devices
@@ -259,7 +290,7 @@ def train(cfg, log_name=None, weights_dir=None, report=None):
     if writer:
         writer.add_text("config", "```toml\n" + Path(cfg["_path"]).read_text() + "\n```")
         writer.add_text("training", "```json\n" + json.dumps(t, indent=2) + "\n```")
-        accelerator.print(f"{len(train_ds)} train / {len(valid_ds)} valid images, {steps_per_epoch} steps per epoch, "
+        accelerator.print(f"classes {classes}; {len(train_ds)} train / {len(valid_ds)} valid images, {steps_per_epoch} steps per epoch, "
                           f"{total_steps} steps planned on {accelerator.num_processes} device(s); "
                           f"evaluating every ~{total_steps / t['num_evals']:.0f} steps; logs in {LOGS_ROOT / log_name}")
 
