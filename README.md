@@ -95,8 +95,9 @@ your own name with `--source`). Files that are not readable images are listed an
 ### 2. Set up the experiment
 
 First choose the training scale range. Open `detection_eda.ipynb` from the repository root, set `DATASET_PATH` to a
-detection dataset (e.g. `data/v0_0_1/geico_detection_train`) and run it. It shows how large faces and plates are, and
-how a candidate range spreads them between one token (too small to find) and one tile (too large to see whole).
+detection dataset (e.g. `data/v0_0_1/geico_detection_train`) and run it. It shows how large faces and plates are, how
+large they become at inference, and how a candidate range spreads them between one token (too small to find) and the
+model input (too large to see whole).
 
 Then open `config/v0_0_1/segmentation.toml` and decide:
 
@@ -104,8 +105,7 @@ Then open `config/v0_0_1/segmentation.toml` and decide:
 |---|---|
 | `job_name` | a name for this experiment, so it doesn't overwrite another one |
 | `backbone` | model size, e.g. `vit_small_patch16_384` |
-| `scale_range` | the random resize factors of training crops, from `detection_eda.ipynb` |
-| `eval_scale` | the one resize factor for whole images in validation, and the default at inference |
+| `scale_range` | the random resize factors of training crops, from `detection_eda.ipynb`. Validation and inference always resize the whole image so its longer side fits the model input. |
 | `epochs` | the longest a run may last; runs usually stop earlier |
 | `valid_subsets` | cities to validate on. Leave empty to validate on a random tenth of the training images, which scores higher than real use. |
 | `[optuna.params]` | which settings to tune, and over what range |
@@ -167,17 +167,15 @@ then run it top to bottom. You get:
 4. random images of your own, before and after blurring
 5. any single image file, blurred and optionally saved
 
-`SCALE` in the notebook's settings tries the model at another resize factor than the one it was validated at.
-
 To blur a file or a whole folder of images without the notebook:
 
 ```bash
 python -m inference.anonymize --weights model_weights/<model id> --input /path/to/photos --output_dir /path/to/out
 ```
 
-Every readable image is written blurred under the same relative path. `--scale` overrides the model's `eval_scale`,
-`--save_masks` also writes the blurred region of each image, and `--threshold`, `--dilate_px` and `--blur_sigma` set
-how much is blurred.
+Every readable image is resized whole to fit the model input, labelled in one pass, and written blurred under the same
+relative path. `--save_masks` also writes the blurred region of each image, and `--threshold`, `--dilate_px` and
+`--blur_sigma` set how much is blurred.
 
 ### Next experiments
 
