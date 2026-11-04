@@ -6,18 +6,18 @@ faces and plates cover a fraction of a percent of the pixels.
 Expectation:
 - Logging, validation and stopping happen at the same shares of training images whatever the batch size or
   number of devices, so runs that differ in those are compared fairly.
-- Validation scores what inference would produce: whole validation images, resized by the configured inference
-  scale, padded and labelled tile by tile.
+- Validation scores what inference would produce: each whole validation image resized so its longer side is the
+  model input size, padded, and labelled in one pass.
 - The model is saved after every validation, so a run that is interrupted or stopped keeps its latest state.
 - A run stops once its validation loss is no longer falling fast enough.
 
 Rationale:
 - Each training crop is the image resized by a random factor from a configured range, then cut or padded to the
-  input size. The model learns faces and plates over the whole range of sizes the factors produce, instead of at
+  model input size. The model learns faces and plates over the whole range of sizes the factors produce, instead of at
   one scale; the range is chosen from the measured object sizes (detection_eda.ipynb).
 - Factors are drawn evenly on a log scale, so halving and doubling an object's size are equally likely.
-- Parts of a crop that fall outside the image are padded with black and labelled background, as inference pads an
-  image smaller than one tile.
+- Parts of a crop that fall outside the image are padded with black and labelled background, as inference pads
+  the resized image to a square.
 - Some crops are placed around an object: random crops would almost always contain background only.
 - The loss adds a Dice term per object class to cross-entropy. Cross-entropy counts pixels, so background
   dominates it; Dice scores each class by overlap, whatever its size.
@@ -130,10 +130,10 @@ def dice_loss(logits, target, cls):
 
 
 @torch.no_grad()
-def evaluate(model, ds, scale=1.0, batch_size=16, accelerator=None):
-    """Label every image in the dataset, resized by `scale` as inference does, and score the result at the image's
-    own resolution: validation loss, and Dice and IoU per class, counted over all pixels of all images. Across several
-    devices each takes a share of the images and the counts are combined.
+def evaluate(model, ds, batch_size=16, accelerator=None):
+    """Label every whole image in the dataset as inference does, `batch_size` images per forward pass, and score the
+    result at the image's own resolution: validation loss, and Dice and IoU per class, counted over all pixels of all
+    images. Across several devices each takes a share of the images and the counts are combined.
 
     The loss weighs the Dice term by 1 whatever weight training uses, so it keeps one scale across runs."""
     n_cls = len(model.classes)
@@ -145,18 +145,11 @@ def evaluate(model, ds, scale=1.0, batch_size=16, accelerator=None):
     sums = torch.zeros(5, n_cls + 1, dtype=torch.float64, device=device)
     was_training = model.training
     model.eval()
-    for row in undecoded(ds):
-        img, mask = decode_row(row)
-        prob = model.predict(img, scale=scale, batch_size=batch_size)
-        pred = prob.argmax(0)
-        target = torch.from_numpy(mask).to(device).long()
-        onehot = F.one_hot(target, n_cls).permute(2, 0, 1).float()
-        sums[0, :n_cls] += torch.bincount(target[pred == target], minlength=n_cls)[:n_cls].double()
-        sums[1, :n_cls] += torch.bincount(pred.flatten(), minlength=n_cls)[:n_cls].double()
-        sums[2, :n_cls] += torch.bincount(target.flatten(), minlength=n_cls)[:n_cls].double()
-        sums[3, :n_cls] += (prob * onehot).sum((1, 2)).double()
-        sums[4, :n_cls] += prob.sum((1, 2)).double()
-        sums[0, n_cls] += -torch.log(prob.gather(0, target[None]).clamp_min(1e-8)).sum().double()
+    rows = undecoded(ds)
+    for start in range(0, len(rows), batch_size):
+        batch = [decode_row(rows[i]) for i in range(start, min(start + batch_size, len(rows)))]
+        for (_, mask), prob in zip(batch, model.predict_batch([img for img, _ in batch])):
+            _add_counts(sums, prob, mask, n_cls)
     model.train(was_training)
     if accelerator is not None:
         sums = accelerator.reduce(sums, reduction="sum")
@@ -173,6 +166,19 @@ def evaluate(model, ds, scale=1.0, batch_size=16, accelerator=None):
     metrics["mean_dice"] = float(dice[1:].mean())          # over the non-background classes
     metrics["mean_iou"] = float(iou[1:].mean())
     return metrics
+
+
+def _add_counts(sums, prob, mask, n_cls):
+    """Add one image's pixel counts to the running sums of evaluate()."""
+    pred = prob.argmax(0)
+    target = torch.from_numpy(mask).to(prob.device).long()
+    onehot = F.one_hot(target, n_cls).permute(2, 0, 1).float()
+    sums[0, :n_cls] += torch.bincount(target[pred == target], minlength=n_cls)[:n_cls].double()
+    sums[1, :n_cls] += torch.bincount(pred.flatten(), minlength=n_cls)[:n_cls].double()
+    sums[2, :n_cls] += torch.bincount(target.flatten(), minlength=n_cls)[:n_cls].double()
+    sums[3, :n_cls] += (prob * onehot).sum((1, 2)).double()
+    sums[4, :n_cls] += prob.sum((1, 2)).double()
+    sums[0, n_cls] += -torch.log(prob.gather(0, target[None]).clamp_min(1e-8)).sum().double()
 
 
 def crosses(step, total, n):
@@ -298,7 +304,7 @@ def train(cfg, log_name=None, weights_dir=None, report=None):
 
             if not crosses(state["step"], total_steps, t["num_evals"]):
                 continue
-            metrics = evaluate(raw_model, valid_ds, t["eval_scale"], t["eval_batch_size"], accelerator)
+            metrics = evaluate(raw_model, valid_ds, t["eval_batch_size"], accelerator)
             state["evals"] += 1
             history.append(metrics["loss"])
             slope = loss_slope(history, t["early_stopping_window"])

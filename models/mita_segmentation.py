@@ -5,16 +5,15 @@ its decoder was written for 150 classes.
 
 Expectation:
 - It takes ordinary 8-bit RGB images; normalisation happens inside.
-- It labels a full image of any size, resized by a factor the caller chooses, and returns each class's
-  probability at the image's own resolution.
+- It labels a full image of any size in one pass, and returns each class's probability at the image's own
+  resolution.
 - A saved model folder reloads into the same model, without downloading anything.
 
 Rationale:
 - The model knows nothing about the data's scale: the grid and the patch size only fix the input size. How large
-  objects appear is set by the caller, through the resize factor at inference and the scaling of training crops.
-- A full image is labelled in tiles of the fixed input size, because the attention fixes that size; shrinking the
-  whole image to fit would erase small objects. An image smaller than one tile is padded, as training pads its
-  crops.
+  objects appear is set by the scaling of training crops, and at inference by the image's own size.
+- At inference the whole image is resized so its longer side is the input size and padded to a square, so the
+  model sees the entire picture at once. Training pads its crops with black the same way.
 - At least three classes are required: the decoder normalises each pixel's class scores, and with only two
   classes the scores collapse to +1/-1, leaving nothing to learn from.
 - The decoder's 150-class limit is lifted by a replacement that is checked to give identical results at 150.
@@ -35,7 +34,6 @@ import segm.model.dec_blocks as dec_blocks
 import segm.model.factory as segm_factory
 from segm.config import load_config
 from segm.model.factory import create_segmenter
-from segm.model.utils import merge_windows, sliding_window
 
 NORM_STATS = {   # segm/data/utils.py STATS (importing segm.data would pull in its dataset dependencies)
     "vit": dict(mean=(0.5, 0.5, 0.5), std=(0.5, 0.5, 0.5)),
@@ -146,32 +144,33 @@ class MitaSegmentation(nn.Module):
         return self.net((images.float() - self.mean) / self.std)
 
     @torch.no_grad()
-    def predict(self, img_rgb, scale=1.0, batch_size=16, amp_dtype=torch.bfloat16):
-        """A full RGB image of any size -> each class's probability for every pixel, at the image's own resolution.
+    def predict(self, img_rgb, amp_dtype=torch.bfloat16):
+        """A full RGB image of any size -> each class's probability for every pixel, at the image's own resolution."""
+        return next(self.predict_batch([img_rgb], amp_dtype))
 
-        The image is resized by `scale`, padded to at least one tile, and labelled tile by tile. Tiles do not overlap,
-        except where the last tile of a row or column is moved back to end at the image border; there the two results
-        are averaged."""
-        device = self.mean.device
-        H, W = img_rgb.shape[:2]
-        x = torch.from_numpy(np.ascontiguousarray(img_rgb)).permute(2, 0, 1)[None].to(device).float()
-        if scale != 1:
-            x = F.interpolate(x, scale_factor=scale, mode="bilinear", align_corners=False, antialias=scale < 1)
-        sh, sw = x.shape[2:]
-        pad_h, pad_w = max(0, self.input_size - sh), max(0, self.input_size - sw)
-        if pad_h or pad_w:                                       # sliding_window needs at least one full window
-            x = F.pad(x, (0, pad_w, 0, pad_h))
-        windows = sliding_window(x, False, self.input_size, self.input_size)
-        crops = torch.cat(windows.pop("crop"))
-        out = []
+    @torch.no_grad()
+    def predict_batch(self, imgs_rgb, amp_dtype=torch.bfloat16):
+        """Full RGB images of any sizes, labelled in one forward pass -> each image's class probabilities at its own
+        resolution, one image at a time.
+
+        Each image is resized so its longer side is the input size and padded with black at the bottom and right to
+        a square input. The probabilities of each image area are resized back to the image only as that image is
+        taken, so only one full-resolution map is held at once."""
+        device, size = self.mean.device, self.input_size
+        inputs, areas = [], []
+        for img in imgs_rgb:
+            H, W = img.shape[:2]
+            scale = size / max(H, W)
+            h, w = min(size, round(H * scale)), min(size, round(W * scale))
+            x = torch.from_numpy(np.ascontiguousarray(img)).permute(2, 0, 1)[None].to(device).float()
+            x = F.interpolate(x, size=(h, w), mode="bilinear", align_corners=False, antialias=scale < 1)
+            inputs.append(F.pad(x, (0, size - w, 0, size - h)))
+            areas.append((H, W, h, w))
         with torch.autocast(device.type, dtype=amp_dtype, enabled=amp_dtype is not None):
-            for i in range(0, len(crops), batch_size):
-                out.append(self(crops[i:i + batch_size]).float())
-        windows["seg_maps"] = torch.cat(out)
-        if not (pad_h or pad_w):
-            return merge_windows(windows, self.input_size, (H, W))  # softmax over classes, resized to (H, W)
-        prob = merge_windows(windows, self.input_size, windows["shape"])[:, :sh, :sw]   # drop the padding
-        return F.interpolate(prob[None], (H, W), mode="bilinear", align_corners=False)[0]
+            logits = self(torch.cat(inputs)).float()
+        for logit, (H, W, h, w) in zip(logits, areas):
+            prob = logit[:, :h, :w].softmax(0)                    # drop the padding
+            yield F.interpolate(prob[None], (H, W), mode="bilinear", align_corners=False)[0]
 
     def save(self, out_dir):
         out_dir = Path(out_dir)
@@ -184,7 +183,7 @@ class MitaSegmentation(nn.Module):
         weights_dir = Path(weights_dir)
         cfg = json.loads((weights_dir / "config.json").read_text())
         assert cfg.pop("model") == "mita_segmentation", f"{weights_dir} does not hold a mita_segmentation model"
-        cfg.pop("px_per_patch", None)      # older models: trained at a fixed scale, now passed to predict instead
+        cfg.pop("px_per_patch", None)      # older models: trained at a fixed scale the model no longer holds
         model = cls(**cfg, pretrained=False)
         model.net.load_state_dict(load_file(weights_dir / "model.safetensors", device="cpu"), strict=True)
         return model.to(device).eval()

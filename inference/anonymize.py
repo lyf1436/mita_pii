@@ -3,24 +3,22 @@
 Usage:
     python -m inference.anonymize --weights model_weights/<model id> --input photo.jpg --output_dir out
     python -m inference.anonymize --weights model_weights/<model id> --input /path/to/photos --output_dir out \
-        --scale 1.5 --save_masks
+        --threshold 0.3 --batch_size 32 --save_masks
 
-Assumption: the weights folder was written by the segmentation trainer, and every image fits in GPU memory once
-resized by the scale.
+Assumption: the weights folder was written by the segmentation trainer.
 
 Expectation: one blurred copy of every readable image, under the same relative path in the output folder, and
 optionally the blurred region of each as a black-and-white PNG next to it. Files that are not readable images are
 listed and left out.
 
 Rationale:
-- An image is resized by one factor, padded to at least one tile and labelled tile by tile, as validation does.
-  The factor defaults to the one the model was validated at, so a script result matches the scores in training.
+- The whole image is resized so its longer side is the model input size, padded to a square and labelled in one
+  pass, as validation does, so a script result matches the scores in training. Several images share each forward
+  pass, which only changes speed and memory, not the result.
 - Everything the model gives a probability of face or plate above the threshold is blurred, and the region is
   grown by a few pixels first, so the edges of a face or plate are blurred too.
 - Images are read upright (orientation tag applied), as the model was trained on them, and written upright."""
 import argparse
-import json
-import re
 from pathlib import Path
 
 import cv2
@@ -31,19 +29,16 @@ from data_pipeline.folder_to_unlabeled import IMG_EXTS, find_images
 from models.mita_segmentation import MitaSegmentation
 
 
-def default_scale(weights_dir):
-    """The scale the model was validated at, or 1 if its folder does not record one."""
-    state = Path(weights_dir) / "train_state.json"
-    training = json.loads(state.read_text()).get("training", {}) if state.exists() else {}
-    if "eval_scale" not in training and "px_per_patch" in training:     # older models: a fixed enlargement
-        return int(re.search(r"patch(\d+)", training["backbone"]).group(1)) / training["px_per_patch"]
-    return float(training.get("eval_scale", 1.0))
+def private_probs(model, imgs_rgb):
+    """RGB uint8 images [H, W, 3], labelled in one forward pass -> for each, the probability that a pixel is not
+    background, float32 [H, W], one image at a time."""
+    for prob in model.predict_batch(imgs_rgb):
+        yield (1 - prob[0]).cpu().numpy()
 
 
-@torch.no_grad()
-def private_prob(model, img_rgb, scale=1.0, batch_size=16):
+def private_prob(model, img_rgb):
     """RGB uint8 [H, W, 3] -> probability that a pixel is not background, float32 [H, W]."""
-    return (1 - model.predict(img_rgb, scale=scale, batch_size=batch_size)[0]).cpu().numpy()
+    return next(private_probs(model, [img_rgb]))
 
 
 def anonymize(img_rgb, prob, threshold=0.5, dilate_px=3, blur_sigma=8):
@@ -61,11 +56,10 @@ def main():
     ap.add_argument("--weights", required=True, type=Path, help="model_weights/<model id>")
     ap.add_argument("--input", required=True, type=Path, help="an image file, or a folder searched recursively")
     ap.add_argument("--output_dir", required=True, type=Path)
-    ap.add_argument("--scale", type=float, help="resize factor before labelling (default: the model's eval_scale)")
     ap.add_argument("--threshold", type=float, default=0.5, help="probability above which a pixel is blurred")
     ap.add_argument("--dilate_px", type=int, default=3, help="grow the blurred region by this many pixels")
     ap.add_argument("--blur_sigma", type=float, default=8)
-    ap.add_argument("--batch_size", type=int, default=16, help="tiles per forward pass")
+    ap.add_argument("--batch_size", type=int, default=16, help="images per forward pass")
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     ap.add_argument("--save_masks", action="store_true", help="also write each blurred region as <name>_mask.png")
     args = ap.parse_args()
@@ -76,25 +70,28 @@ def main():
         root, paths = args.input, find_images(args.input)
     if not paths:
         raise FileNotFoundError(f"no images ({', '.join(sorted(IMG_EXTS))}) at {args.input}")
-    scale = args.scale if args.scale is not None else default_scale(args.weights)
     model = MitaSegmentation.load(args.weights, device=args.device)
-    print(f"{len(paths)} image(s), scale {scale:g}, threshold {args.threshold:g}, device {args.device}")
+    print(f"{len(paths)} image(s), threshold {args.threshold:g}, device {args.device}")
 
     skipped = []
-    for path in paths:
-        img = cv2.imread(str(path), cv2.IMREAD_COLOR)                # orientation tag applied
-        if img is None:
-            skipped.append(path)
+    for start in range(0, len(paths), args.batch_size):
+        batch = []
+        for path in paths[start:start + args.batch_size]:
+            img = cv2.imread(str(path), cv2.IMREAD_COLOR)            # orientation tag applied
+            if img is None:
+                skipped.append(path)
+            else:
+                batch.append((path, cv2.cvtColor(img, cv2.COLOR_BGR2RGB)))
+        if not batch:
             continue
-        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-        anon, mask = anonymize(img, private_prob(model, img, scale, args.batch_size),
-                               args.threshold, args.dilate_px, args.blur_sigma)
-        out = args.output_dir / path.relative_to(root)
-        out.parent.mkdir(parents=True, exist_ok=True)
-        cv2.imwrite(str(out), cv2.cvtColor(anon, cv2.COLOR_RGB2BGR))
-        if args.save_masks:
-            cv2.imwrite(str(out.with_name(f"{out.stem}_mask.png")), mask * 255)
-        print(f"{out}: {100 * mask.mean():.2f}% of pixels blurred")
+        for (path, img), prob in zip(batch, private_probs(model, [img for _, img in batch])):
+            anon, mask = anonymize(img, prob, args.threshold, args.dilate_px, args.blur_sigma)
+            out = args.output_dir / path.relative_to(root)
+            out.parent.mkdir(parents=True, exist_ok=True)
+            cv2.imwrite(str(out), cv2.cvtColor(anon, cv2.COLOR_RGB2BGR))
+            if args.save_masks:
+                cv2.imwrite(str(out.with_name(f"{out.stem}_mask.png")), mask * 255)
+            print(f"{out}: {100 * mask.mean():.2f}% of pixels blurred")
 
     print(f"wrote {len(paths) - len(skipped)} image(s) to {args.output_dir}")
     if skipped:
