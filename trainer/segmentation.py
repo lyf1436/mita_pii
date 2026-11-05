@@ -304,8 +304,9 @@ def train(cfg, log_name=None, weights_dir=None, report=None):
     state, metrics, history = dict(epoch=0, step=0, images=0, evals=0, stopped_early=None), {}, []
     acc = dict(loss=0.0, ce=0.0, **{f"dice_{n}": 0.0 for _, n in fg}, n=0, t=time.perf_counter())
     model.train()
+    batch_iter = batches()
     try:
-        for state["epoch"], (ims, masks) in batches():
+        for state["epoch"], (ims, masks) in batch_iter:
             with accelerator.autocast():
                 logits = model(ims)
             logits = logits.float()
@@ -363,11 +364,25 @@ def train(cfg, log_name=None, weights_dir=None, report=None):
             save_model(raw_model, weights_dir, cfg, dict(state, valid=metrics))
         raise
     finally:
+        batch_iter.close()
+        shutdown_workers(loader)
         if writer:
             writer.close()
     accelerator.wait_for_everyone()
     accelerator.free_memory()
     return metrics, raw_model
+
+
+def shutdown_workers(loader):
+    """Stop the loader's persistent worker processes now. A run that ends by an exception (e.g. a pruned tuning
+    trial) would otherwise leave them alive until the garbage collector happens to run, since the exception's
+    traceback keeps the loader referenced; tuning runs trial after trial in one process, so they pile up until
+    starting the next trial's workers fails with "Cannot allocate memory"."""
+    base = getattr(loader, "base_dataloader", loader)          # accelerate wraps the torch DataLoader
+    workers = getattr(base, "_iterator", None)
+    if workers is not None and hasattr(workers, "_shutdown_workers"):
+        workers._shutdown_workers()
+    base._iterator = None
 
 
 def default_weights_dir(cfg):
