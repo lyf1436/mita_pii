@@ -184,8 +184,10 @@ python -m inference.anonymize --weights model_weights/<model id> --input /path/t
 ```
 
 Every readable image is resized whole to fit the model input, labelled in one pass, and written blurred under the same
-relative path. `--batch_size` sets how many images share a forward pass, `--save_masks` also writes the blurred
-region of each image, and `--threshold`, `--dilate_px` and `--blur_sigma` set how much is blurred.
+relative path. `--batch_size` sets how many images share a forward pass (default 32; images of any sizes can share
+one), `--save_masks` also writes the blurred region of each image, and `--threshold`, `--dilate_px` and `--blur_sigma`
+set how much is blurred. `--dilate_px` and `--blur_sigma` are measured on an image whose longer side is
+`--reference_size` (480) pixels and scale with each image, so a photo is blurred the same way at any resolution.
 
 ### Next experiments
 
