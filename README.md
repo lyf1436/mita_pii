@@ -63,6 +63,13 @@ python -m data_pipeline.pp4av_to_segmentation --save_dir data/v0_0_1 --raw_dir /
 - You get `data/v0_0_1/pp4av_segmentation_train` and `data/v0_0_1/pp4av_segmentation_test`. The command prints how many
   images and which cities went into each.
 - If the folders already exist the command stops. Add `--overwrite` to rebuild them.
+- PP4AV's labels are `face` and `plate`. `--label_rename` renames them, as for the COCO data below (several to one
+  name merges them, `null` drops them). Listing both under their own names keeps them as they are:
+
+```bash
+python -m data_pipeline.pp4av_to_segmentation --save_dir data/v0_0_1 --raw_dir /data/pp4av \
+    --label_rename '{"face": "face", "plate": "plate"}'
+```
 
 Optional: the internal four-task photo set (COCO boxes). A box's label is its category's supercategory;
 `--label_rename` renames them (several to one name merges them, `null` drops them). To keep only the licence plates,

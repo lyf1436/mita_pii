@@ -3,6 +3,8 @@
 Usage:
     python -m data_pipeline.pp4av_to_segmentation --save_dir data/v0_0_1
     python -m data_pipeline.pp4av_to_segmentation --save_dir data/v0_0_1 --raw_dir /data/pp4av --overwrite
+    python -m data_pipeline.pp4av_to_segmentation --save_dir data/v0_0_1 \
+        --label_rename '{"face": "face", "plate": "plate"}'
 
 Assumption: a labelled box is a close enough outline of a face or plate for blurring.
 
@@ -14,7 +16,17 @@ Columns: image_id, source, subset (the city), image (stored bytes), mask (single
 label_names[v]), label_names. Other segmentation pipelines save the same columns, so their datasets concatenate
 with these; the trainer reads the class names from label_names, so no pipeline needs to know another's classes.
 
+Labels:
+- PP4AV has two labels, "face" and "plate" (classes 0 and 1 of its label files). A box's label is renamed by
+  --label_rename if it is listed there.
+- --label_rename is a JSON object {PP4AV label: new name}. Both labels may get the same new name: they become one
+  label. A new name of null drops the label's boxes; a new name of "background" makes its boxes background, which
+  is the same thing in a mask.
+- Mask value 0 is "background"; the labels follow in alphabetical order.
+
 Rationale:
+- Labels are renamed with the same argument as the COCO pipelines, so datasets from both can be given matching
+  class names, which the trainer then merges into one class.
 - Boxes are filled in as masks because everything inside a box is to be blurred. Box edges are rounded outwards,
   so no edge pixel of a face or plate is left unmarked.
 - Whole cities are held out for testing: the images of one city are frames of one driving video and many are
@@ -23,10 +35,11 @@ Rationale:
   scales the images.
 - An image's size is measured with its orientation tag applied, as the trainer decodes it, so image and mask
   never come out turned against each other.
-- The class names travel with every row instead of being fixed in shared code, so this script alone decides which
-  classes it produces and in which order.
+- The class names travel with every row instead of being fixed in shared code, so this script and its arguments
+  alone decide which classes it produces.
 - The source archives are downloaded and unpacked once and reused on later runs."""
 import argparse
+import json
 import shutil
 import zipfile
 from pathlib import Path
@@ -41,8 +54,8 @@ from data_pipeline.hf_save import save_generated
 HF_REPO = "khaclinh/pp4av"
 SOURCE = "pp4av"
 IMG_EXTS = {".png", ".jpg", ".jpeg"}
-LABEL_NAMES = ["background", "face", "plate"]     # mask pixel value -> class name
-LABEL_TO_CLASS = {0: LABEL_NAMES.index("face"), 1: LABEL_NAMES.index("plate")}   # PP4AV label file class -> mask value
+BACKGROUND = "background"                          # the name of mask value 0
+PP4AV_LABELS = ["face", "plate"]                   # PP4AV label file class -> label
 
 FEATURES = Features({
     "image_id": Value("string"),            # <city>/<file stem>
@@ -75,9 +88,22 @@ def index_images(img_dir, ann_dir):
             for p in sorted(q for q in img_dir.rglob("*") if q.suffix.lower() in IMG_EXTS)]
 
 
-def rasterise(label_path, W, H):
-    """Mark every labelled box with its class over the whole image, rounding box edges outwards. Where boxes
-    overlap, the box listed later wins."""
+def class_values(label_rename):
+    """The mask's label names, and the mask value of each PP4AV label file class (None: the box is not marked)."""
+    unknown = set(label_rename) - set(PP4AV_LABELS)
+    if unknown:
+        raise ValueError(f"--label_rename names {sorted(unknown)}, which are not PP4AV labels; it has {PP4AV_LABELS}")
+    labels = [label_rename.get(name, name) for name in PP4AV_LABELS]
+    label_names = [BACKGROUND] + sorted({lb for lb in labels if lb is not None and lb != BACKGROUND})
+    if len(label_names) == 1:
+        raise ValueError("--label_rename leaves no label: every mask would be background")
+    value = {name: v for v, name in enumerate(label_names)}
+    return label_names, [value.get(lb) if lb != BACKGROUND else None for lb in labels]
+
+
+def rasterise(label_path, W, H, values):
+    """Mark every kept box with its mask value (`values`, by PP4AV class) over the whole image, rounding box edges
+    outwards. Where boxes overlap, the box listed later wins."""
     mask = np.zeros((H, W), np.uint8)
     if label_path is None:
         return mask
@@ -85,7 +111,9 @@ def rasterise(label_path, W, H):
         parts = line.split()
         if len(parts) < 5:
             continue
-        cls = LABEL_TO_CLASS[int(parts[0])]
+        cls = values[int(parts[0])]
+        if cls is None:
+            continue
         cx, cy, bw, bh = map(float, parts[1:5])
         x1, y1 = int(np.floor((cx - bw / 2) * W)), int(np.floor((cy - bh / 2) * H))
         x2, y2 = int(np.ceil((cx + bw / 2) * W)), int(np.ceil((cy + bh / 2) * H))
@@ -93,15 +121,15 @@ def rasterise(label_path, W, H):
     return mask
 
 
-def generate(items):
+def generate(items, label_names, values):
     for img_path, subset, label_path in items:
         raw = Path(img_path).read_bytes()        # stored as-is: no re-encoding of the image
         H, W = cv2.imdecode(np.frombuffer(raw, np.uint8), cv2.IMREAD_COLOR).shape[:2]   # as the trainer decodes it
-        ok, png = cv2.imencode(".png", rasterise(label_path, W, H))
+        ok, png = cv2.imencode(".png", rasterise(label_path, W, H, values))
         assert ok
         yield dict(image_id=f"{subset}/{Path(img_path).stem}", source=SOURCE, subset=subset,
                    image={"bytes": raw, "path": Path(img_path).name},
-                   mask={"bytes": png.tobytes(), "path": None}, label_names=LABEL_NAMES)
+                   mask={"bytes": png.tobytes(), "path": None}, label_names=list(label_names))
 
 
 def main():
@@ -110,9 +138,16 @@ def main():
     ap.add_argument("--raw_dir", type=Path, default=Path("data/raw/pp4av"), help="download / extraction cache")
     ap.add_argument("--test_subsets", nargs="+", default=["switzerland", "strasbourg"],
                     help="subsets (cities) that form the test split")
+    ap.add_argument("--label_rename", type=json.loads, default={},
+                    help='JSON object {PP4AV label: new label, or null to drop}; the labels are "face" and "plate", '
+                         'e.g. \'{"face": "face", "plate": "plate"}\'')
     ap.add_argument("--num_proc", type=int, default=8)
     ap.add_argument("--overwrite", action="store_true")
     args = ap.parse_args()
+    if not isinstance(args.label_rename, dict):
+        raise ValueError("--label_rename must be a JSON object")
+    label_names, values = class_values(args.label_rename)
+    print(f"labels {label_names[1:]}")
 
     img_dir = fetch_and_extract(args.raw_dir, "images.zip", "images")
     ann_dir = fetch_and_extract(args.raw_dir, "annotations.zip", "annotations")
@@ -133,7 +168,9 @@ def main():
             if not args.overwrite:
                 raise FileExistsError(f"{out} exists (pass --overwrite to replace it)")
             shutil.rmtree(out)
-        ds = save_generated(generate, FEATURES, {"items": split_items}, out,
+        # each worker process gets an equal share of `items`, the only list argument (the others are tuples)
+        ds = save_generated(generate, FEATURES,
+                            {"items": split_items, "label_names": tuple(label_names), "values": tuple(values)}, out,
                             num_proc=min(args.num_proc, len(split_items)))
         print(f"{out}: {len(ds)} images from {sorted({s for _, s, _ in split_items})}")
 
