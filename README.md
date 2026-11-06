@@ -176,7 +176,7 @@ then run it top to bottom. You get:
    anonymized image
 3. for each label, a grid of close-ups of 100 random objects, each original next to its anonymized crop
 
-Sections 3 and 4 draw new random samples every time their cells are run.
+Sections 3, 4 and 5 draw new random samples every time their cells are run.
 4. random images of your own, before and after blurring
 5. any single image file, blurred and optionally saved
 
