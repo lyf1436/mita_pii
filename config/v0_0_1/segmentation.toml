@@ -27,6 +27,9 @@ drop_path_rate = 0.1
 valid_fraction = 0.1          # random share of the training images held out for validation ...
 valid_subsets = []            # ... unless whole subsets are named here (avoids near-duplicate frames in both)
 seed = 0
+rotation_range = [-90, 90]    # each training image is first rotated by a random angle in this range (degrees) ...
+corner_jitter = 0.1           # ... and each corner then moved by up to this share of the width across and height down;
+                              # the largest upright rectangle inside the warped image is kept
 scale_range = [0.5, 2.0]      # each training crop: image resized by a random factor in this range (log-uniform),
                               # then cut or padded to the model input; pick it with detection_eda.ipynb.
                               # (validation and inference: whole image resized so its longer side fits, then padded)

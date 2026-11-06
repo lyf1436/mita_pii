@@ -116,6 +116,7 @@ Then open `config/v0_0_1/segmentation.toml` and decide:
 | `job_name` | a name for this experiment, so it doesn't overwrite another one |
 | `backbone` | model size, e.g. `vit_small_patch16_384` |
 | `scale_range` | the random resize factors of training crops, from `detection_eda.ipynb`. Validation and inference always resize the whole image so its longer side fits the model input. |
+| `rotation_range`, `corner_jitter` | the random rotation (degrees) and corner shifts (share of width and height) applied to each training image before it is rescaled and cropped. The largest upright rectangle inside the warped image is kept, so no warp border enters training. |
 | `epochs` | the longest a run may last; runs usually stop earlier |
 | `valid_subsets` | cities to validate on. Leave empty to validate on a random tenth of the training images, which scores higher than real use. |
 | `[optuna.params]` | which settings to tune, and over what range |

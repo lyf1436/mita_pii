@@ -16,13 +16,20 @@ Rationale:
 - The model's classes are the union of the label names of the training data: the background first, then the other
   names in alphabetical order. Datasets prepared separately can thus list their classes in any order, and the same
   name in two datasets is one class. Each mask is translated to the model's class indices as it is read.
-- Each training crop is the image resized by a random factor from a configured range, then cut or padded to the
-  model input size. The model learns faces and plates over the whole range of sizes the factors produce, instead of at
-  one scale; the range is chosen from the measured object sizes (detection_eda.ipynb).
+- Each training image is first rotated by a random angle and its corners then each moved by a random offset (one
+  homography for both, so the image is resampled once), and the largest upright rectangle inside the warped image
+  is cut out. The model thus meets faces and plates at any tilt and under perspective, and no warp border enters
+  the crop: the only black left is the padding, which inference also adds.
+- The image and mask are warped by the same homography; the mask by nearest neighbour, so it keeps its classes.
+- Each training crop is the warped image resized by a random factor from a configured range, then cut or padded to
+  the model input size. The model learns faces and plates over the whole range of sizes the factors produce, instead
+  of at one scale; the range is chosen from the measured object sizes (detection_eda.ipynb).
 - Factors are drawn evenly on a log scale, so halving and doubling an object's size are equally likely.
 - Parts of a crop that fall outside the image are padded with black and labelled background, as inference pads
   the resized image to a square.
 - Some crops are placed around an object: random crops would almost always contain background only.
+- No flip: a mirrored image shows plates with mirrored text, which no camera produces; rotation and perspective
+  keep text readable.
 - The loss adds a Dice term per object class to cross-entropy. Cross-entropy counts pixels, so background
   dominates it; Dice scores each class by overlap, whatever its size.
 - The validation loss weighs the Dice term by 1 whatever weight training uses, so runs trained with different
@@ -121,17 +128,67 @@ def scaled_window(arr, x0, y0, win, size, interpolation):
     return out, inside
 
 
+def random_homography(W, H, rotation_range, corner_jitter):
+    """A homography that rotates a W x H image about its centre by a random angle from `rotation_range` (degrees)
+    and then moves each of its corners by a random offset up to `corner_jitter` * W across and * H down, and the
+    four corners it maps the image to. Coordinates are those of pixel centres, so the image spans -0.5 .. W - 0.5."""
+    corners = np.array([[-0.5, -0.5], [W - 0.5, -0.5], [W - 0.5, H - 0.5], [-0.5, H - 0.5]])
+    t = np.deg2rad(random.uniform(*rotation_range))
+    rot = np.array([[np.cos(t), -np.sin(t)], [np.sin(t), np.cos(t)]])
+    centre = np.array([(W - 1) / 2, (H - 1) / 2])
+    dst = (corners - centre) @ rot.T + centre
+    dst += np.array([[random.uniform(-1, 1) * corner_jitter * W, random.uniform(-1, 1) * corner_jitter * H]
+                     for _ in range(4)])
+    return cv2.getPerspectiveTransform(corners.astype(np.float32), dst.astype(np.float32)), dst
+
+
+def largest_inner_rect(quad, n=256):
+    """The largest upright rectangle (x1, y1, x2, y2) inside a convex polygon, with its top and bottom on a grid of
+    `n` heights. In a convex polygon the left border is convex and the right border concave in y, so a rectangle
+    spanning heights y1..y2 fits exactly when its sides fit at y1 and at y2: every pair of heights is scored at once."""
+    ys = np.linspace(quad[:, 1].min(), quad[:, 1].max(), n)
+    p, q = quad, np.roll(quad, -1, axis=0)                          # the polygon's edges p -> q
+    with np.errstate(divide="ignore", invalid="ignore"):
+        t = (ys[:, None] - p[:, 1]) / (q[:, 1] - p[:, 1])
+    x = p[:, 0] + t * (q[:, 0] - p[:, 0])
+    hit = (t >= 0) & (t <= 1)                                       # false for horizontal edges (t is nan or inf)
+    lo, hi = np.where(hit, x, np.inf).min(1), np.where(hit, x, -np.inf).max(1)
+    left, right = np.maximum(lo[:, None], lo[None, :]), np.minimum(hi[:, None], hi[None, :])
+    area = np.triu(ys[None, :] - ys[:, None]) * np.clip(right - left, 0, None)
+    i, j = np.unravel_index(np.argmax(area), area.shape)
+    return left[i, j], ys[i], right[i, j], ys[j]
+
+
+def random_warp(img, mask, rotation_range, corner_jitter):
+    """The image and mask rotated and corner-jittered by one random homography, cut to the largest upright rectangle
+    inside the warped image. Returns them unchanged in the rare case that rectangle is under 2 pixels on a side."""
+    Hh, Ww = img.shape[:2]
+    M, quad = random_homography(Ww, Hh, rotation_range, corner_jitter)
+    x1, y1, x2, y2 = largest_inner_rect(quad)
+    ox, oy = int(np.ceil(x1)), int(np.ceil(y1))                    # output pixels whose centres lie in the rectangle
+    w, h = int(np.floor(x2)) - ox + 1, int(np.floor(y2)) - oy + 1
+    if w < 2 or h < 2:
+        return img, mask
+    M = np.array([[1, 0, -ox], [0, 1, -oy], [0, 0, 1]]) @ M        # output pixel (0, 0) is image point (ox, oy)
+    # replicate: pixels on the rectangle's edge may reach a fraction of a pixel past the image when interpolating
+    img = cv2.warpPerspective(img, M, (w, h), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
+    mask = cv2.warpPerspective(mask, M, (w, h), flags=cv2.INTER_NEAREST, borderMode=cv2.BORDER_REPLICATE)
+    return img, mask
+
+
 class CropDataset(torch.utils.data.Dataset):
     def __init__(self, ds, input_size, tcfg, classes):
         self.ds, self.input_size, self.classes = undecoded(ds), input_size, list(classes)
         self.log_scale_range = tuple(np.log(tcfg["scale_range"]))
         self.object_crop_prob = tcfg["object_crop_prob"]
+        self.rotation_range, self.corner_jitter = tuple(tcfg["rotation_range"]), tcfg["corner_jitter"]
 
     def __len__(self):
         return len(self.ds)
 
     def __getitem__(self, i):
         img, mask = decode_row(self.ds[i], self.classes)
+        img, mask = random_warp(img, mask, self.rotation_range, self.corner_jitter)
         H, W = img.shape[:2]
         size = self.input_size
         scale = float(np.exp(random.uniform(*self.log_scale_range)))
@@ -149,8 +206,6 @@ class CropDataset(torch.utils.data.Dataset):
         crop_mask, _ = scaled_window(mask, x0, y0, win, size, cv2.INTER_NEAREST)
         alpha, beta = random.uniform(0.8, 1.2), random.uniform(-20, 20)       # on the image only: padding stays black
         crop[inside] = np.clip(crop[inside].astype(np.float32) * alpha + beta, 0, 255).astype(np.uint8)
-        if random.random() < 0.5:
-            crop, crop_mask = crop[:, ::-1], crop_mask[:, ::-1]
         return (torch.from_numpy(np.ascontiguousarray(crop)).permute(2, 0, 1),
                 torch.from_numpy(np.ascontiguousarray(crop_mask)).long())
 
