@@ -172,8 +172,11 @@ then run it top to bottom. You get:
 
 1. test scores next to the validation scores from training. If test is much lower, validation was too easy: name
    validation cities in step 2 and train again.
-2. the test images with the most faces and plates, before and after blurring
-3. close-ups of single faces and plates, before and after blurring
+2. for each label, a few random test images containing it: the input with its boxes, the blurred region, and the
+   anonymized image
+3. for each label, a grid of close-ups of 100 random objects, each original next to its anonymized crop
+
+Sections 3 and 4 draw new random samples every time their cells are run.
 4. random images of your own, before and after blurring
 5. any single image file, blurred and optionally saved
 
